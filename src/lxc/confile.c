@@ -22,66 +22,76 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #define __STDC_FORMAT_MACROS
+#include <arpa/inet.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <syslog.h>
-#include <time.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <net/if.h>
-#include <netinet/in.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <syslog.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "conf.h"
 #include "config.h"
 #include "confile.h"
 #include "confile_utils.h"
+#include "../include/netns_ifaddrs.h"
 #include "log.h"
 #include "lxcseccomp.h"
+#include "memory_utils.h"
 #include "network.h"
 #include "parse.h"
 #include "storage.h"
 #include "utils.h"
 
-#if HAVE_IFADDRS_H
-#include <ifaddrs.h>
-#else
-#include <../include/ifaddrs.h>
-#endif
-
 #if HAVE_SYS_PERSONALITY_H
 #include <sys/personality.h>
 #endif
 
-lxc_log_define(lxc_confile, lxc);
+#ifndef HAVE_STRLCPY
+#include "include/strlcpy.h"
+#endif
 
-#define lxc_config_define(name)                                                \
-	static int set_config_##name(const char *, const char *,               \
-				     struct lxc_conf *, void *);               \
-	static int get_config_##name(const char *, char *, int,                \
-				     struct lxc_conf *, void *);               \
-	static int clr_config_##name(const char *, struct lxc_conf *, void *);
+#ifndef HAVE_STRLCAT
+#include "include/strlcat.h"
+#endif
+
+lxc_log_define(confile, lxc);
+
+#define lxc_config_define(name)                                             \
+	__hot static int set_config_##name(const char *, const char *,      \
+					   struct lxc_conf *, void *);      \
+	__hot static int get_config_##name(const char *, char *, int,       \
+					   struct lxc_conf *, void *);      \
+	__hot static int clr_config_##name(const char *, struct lxc_conf *, \
+					   void *);
 
 lxc_config_define(autodev);
 lxc_config_define(apparmor_allow_incomplete);
+lxc_config_define(apparmor_allow_nesting);
 lxc_config_define(apparmor_profile);
+lxc_config_define(apparmor_raw);
 lxc_config_define(cap_drop);
 lxc_config_define(cap_keep);
 lxc_config_define(cgroup_controller);
 lxc_config_define(cgroup2_controller);
 lxc_config_define(cgroup_dir);
+lxc_config_define(cgroup_relative);
 lxc_config_define(console_buffer_size);
 lxc_config_define(console_logfile);
 lxc_config_define(console_path);
@@ -103,6 +113,7 @@ lxc_config_define(log_file);
 lxc_config_define(log_level);
 lxc_config_define(log_syslog);
 lxc_config_define(monitor);
+lxc_config_define(monitor_signal_pdeath);
 lxc_config_define(mount);
 lxc_config_define(mount_auto);
 lxc_config_define(mount_fstab);
@@ -130,10 +141,12 @@ lxc_config_define(no_new_privs);
 lxc_config_define(personality);
 lxc_config_define(prlimit);
 lxc_config_define(pty_max);
+lxc_config_define(rootfs_managed);
 lxc_config_define(rootfs_mount);
 lxc_config_define(rootfs_options);
 lxc_config_define(rootfs_path);
 lxc_config_define(seccomp_profile);
+lxc_config_define(seccomp_allow_nesting);
 lxc_config_define(selinux_context);
 lxc_config_define(signal_halt);
 lxc_config_define(signal_reboot);
@@ -145,15 +158,18 @@ lxc_config_define(uts_name);
 lxc_config_define(sysctl);
 lxc_config_define(proc);
 
-static struct lxc_config_t config[] = {
+static struct lxc_config_t config_jump_table[] = {
 	{ "lxc.arch",                      set_config_personality,                 get_config_personality,                 clr_config_personality,               },
 	{ "lxc.apparmor.profile",          set_config_apparmor_profile,            get_config_apparmor_profile,            clr_config_apparmor_profile,          },
 	{ "lxc.apparmor.allow_incomplete", set_config_apparmor_allow_incomplete,   get_config_apparmor_allow_incomplete,   clr_config_apparmor_allow_incomplete, },
+	{ "lxc.apparmor.allow_nesting",    set_config_apparmor_allow_nesting,      get_config_apparmor_allow_nesting,      clr_config_apparmor_allow_nesting,    },
+	{ "lxc.apparmor.raw",              set_config_apparmor_raw,                get_config_apparmor_raw,                clr_config_apparmor_raw,              },
 	{ "lxc.autodev",                   set_config_autodev,                     get_config_autodev,                     clr_config_autodev,                   },
 	{ "lxc.cap.drop",                  set_config_cap_drop,                    get_config_cap_drop,                    clr_config_cap_drop,                  },
 	{ "lxc.cap.keep",                  set_config_cap_keep,                    get_config_cap_keep,                    clr_config_cap_keep,                  },
 	{ "lxc.cgroup2",                   set_config_cgroup2_controller,          get_config_cgroup2_controller,          clr_config_cgroup2_controller,        },
 	{ "lxc.cgroup.dir",                set_config_cgroup_dir,                  get_config_cgroup_dir,                  clr_config_cgroup_dir,                },
+	{ "lxc.cgroup.relative",           set_config_cgroup_relative,             get_config_cgroup_relative,             clr_config_cgroup_relative,           },
 	{ "lxc.cgroup",                    set_config_cgroup_controller,           get_config_cgroup_controller,           clr_config_cgroup_controller,         },
 	{ "lxc.console.buffer.size",       set_config_console_buffer_size,         get_config_console_buffer_size,         clr_config_console_buffer_size,       },
 	{ "lxc.console.logfile",           set_config_console_logfile,             get_config_console_logfile,             clr_config_console_logfile,           },
@@ -186,6 +202,7 @@ static struct lxc_config_t config[] = {
 	{ "lxc.log.level",                 set_config_log_level,                   get_config_log_level,                   clr_config_log_level,                 },
 	{ "lxc.log.syslog",                set_config_log_syslog,                  get_config_log_syslog,                  clr_config_log_syslog,                },
 	{ "lxc.monitor.unshare",           set_config_monitor,                     get_config_monitor,                     clr_config_monitor,                   },
+	{ "lxc.monitor.signal.pdeath",     set_config_monitor_signal_pdeath,       get_config_monitor_signal_pdeath,       clr_config_monitor_signal_pdeath,     },
 	{ "lxc.mount.auto",                set_config_mount_auto,                  get_config_mount_auto,                  clr_config_mount_auto,                },
 	{ "lxc.mount.entry",               set_config_mount,                       get_config_mount,                       clr_config_mount,                     },
 	{ "lxc.mount.fstab",               set_config_mount_fstab,                 get_config_mount_fstab,                 clr_config_mount_fstab,               },
@@ -212,9 +229,11 @@ static struct lxc_config_t config[] = {
 	{ "lxc.no_new_privs",	           set_config_no_new_privs,                get_config_no_new_privs,                clr_config_no_new_privs,              },
 	{ "lxc.prlimit",                   set_config_prlimit,                     get_config_prlimit,                     clr_config_prlimit,                   },
 	{ "lxc.pty.max",                   set_config_pty_max,                     get_config_pty_max,                     clr_config_pty_max,                   },
+	{ "lxc.rootfs.managed",            set_config_rootfs_managed,              get_config_rootfs_managed,              clr_config_rootfs_managed,            },
 	{ "lxc.rootfs.mount",              set_config_rootfs_mount,                get_config_rootfs_mount,                clr_config_rootfs_mount,              },
 	{ "lxc.rootfs.options",            set_config_rootfs_options,              get_config_rootfs_options,              clr_config_rootfs_options,            },
 	{ "lxc.rootfs.path",               set_config_rootfs_path,                 get_config_rootfs_path,                 clr_config_rootfs_path,               },
+	{ "lxc.seccomp.allow_nesting",     set_config_seccomp_allow_nesting,       get_config_seccomp_allow_nesting,       clr_config_seccomp_allow_nesting,     },
 	{ "lxc.seccomp.profile",           set_config_seccomp_profile,             get_config_seccomp_profile,             clr_config_seccomp_profile,           },
 	{ "lxc.selinux.context",           set_config_selinux_context,             get_config_selinux_context,             clr_config_selinux_context,           },
 	{ "lxc.signal.halt",               set_config_signal_halt,                 get_config_signal_halt,                 clr_config_signal_halt,               },
@@ -230,99 +249,15 @@ static struct lxc_config_t config[] = {
 	{ "lxc.proc",                      set_config_proc,                        get_config_proc,                        clr_config_proc,                      },
 };
 
-struct signame {
-	int num;
-	const char *name;
-};
-
-static const struct signame signames[] = {
-	{ SIGHUP,    "HUP"    },
-	{ SIGINT,    "INT"    },
-	{ SIGQUIT,   "QUIT"   },
-	{ SIGILL,    "ILL"    },
-	{ SIGABRT,   "ABRT"   },
-	{ SIGFPE,    "FPE"    },
-	{ SIGKILL,   "KILL"   },
-	{ SIGSEGV,   "SEGV"   },
-	{ SIGPIPE,   "PIPE"   },
-	{ SIGALRM,   "ALRM"   },
-	{ SIGTERM,   "TERM"   },
-	{ SIGUSR1,   "USR1"   },
-	{ SIGUSR2,   "USR2"   },
-	{ SIGCHLD,   "CHLD"   },
-	{ SIGCONT,   "CONT"   },
-	{ SIGSTOP,   "STOP"   },
-	{ SIGTSTP,   "TSTP"   },
-	{ SIGTTIN,   "TTIN"   },
-	{ SIGTTOU,   "TTOU"   },
-#ifdef SIGTRAP
-	{ SIGTRAP,   "TRAP"   },
-#endif
-#ifdef SIGIOT
-	{ SIGIOT,    "IOT"    },
-#endif
-#ifdef SIGEMT
-	{ SIGEMT,    "EMT"    },
-#endif
-#ifdef SIGBUS
-	{ SIGBUS,    "BUS"    },
-#endif
-#ifdef SIGSTKFLT
-	{ SIGSTKFLT, "STKFLT" },
-#endif
-#ifdef SIGCLD
-	{ SIGCLD,    "CLD"    },
-#endif
-#ifdef SIGURG
-	{ SIGURG,    "URG"    },
-#endif
-#ifdef SIGXCPU
-	{ SIGXCPU,   "XCPU"   },
-#endif
-#ifdef SIGXFSZ
-	{ SIGXFSZ,   "XFSZ"   },
-#endif
-#ifdef SIGVTALRM
-	{ SIGVTALRM, "VTALRM" },
-#endif
-#ifdef SIGPROF
-	{ SIGPROF,   "PROF"   },
-#endif
-#ifdef SIGWINCH
-	{ SIGWINCH,  "WINCH"  },
-#endif
-#ifdef SIGIO
-	{ SIGIO,     "IO"     },
-#endif
-#ifdef SIGPOLL
-	{ SIGPOLL,   "POLL"   },
-#endif
-#ifdef SIGINFO
-	{ SIGINFO,   "INFO"   },
-#endif
-#ifdef SIGLOST
-	{ SIGLOST,   "LOST"   },
-#endif
-#ifdef SIGPWR
-	{ SIGPWR,    "PWR"    },
-#endif
-#ifdef SIGUNUSED
-	{ SIGUNUSED, "UNUSED" },
-#endif
-#ifdef SIGSYS
-	{ SIGSYS,    "SYS"    },
-#endif
-};
-
-static const size_t config_size = sizeof(config) / sizeof(struct lxc_config_t);
+static const size_t config_jump_table_size = sizeof(config_jump_table) / sizeof(struct lxc_config_t);
 
 struct lxc_config_t *lxc_get_config(const char *key)
 {
 	size_t i;
 
-	for (i = 0; i < config_size; i++)
-		if (!strncmp(config[i].name, key, strlen(config[i].name)))
-			return &config[i];
+	for (i = 0; i < config_jump_table_size; i++)
+		if (!strncmp(config_jump_table[i].name, key, strlen(config_jump_table[i].name)))
+			return &config_jump_table[i];
 
 	return NULL;
 }
@@ -364,7 +299,7 @@ static int set_config_net_type(const char *key, const char *value,
 	} else if (!strcmp(value, "none")) {
 		netdev->type = LXC_NET_NONE;
 	} else {
-		ERROR("invalid network type %s", value);
+		ERROR("Invalid network type %s", value);
 		return -1;
 	}
 
@@ -390,21 +325,22 @@ static int set_config_net_flags(const char *key, const char *value,
 static int create_matched_ifnames(const char *value, struct lxc_conf *lxc_conf,
 				  struct lxc_netdev *netdev)
 {
-	struct ifaddrs *ifaddr, *ifa;
+	struct netns_ifaddrs *ifaddr, *ifa;
 	int n;
 	int ret = 0;
 	const char *type_key = "lxc.net.type";
 	const char *link_key = "lxc.net.link";
 	const char *tmpvalue = "phys";
 
-	if (getifaddrs(&ifaddr) == -1) {
-		SYSERROR("Get network interfaces failed");
+	if (netns_getifaddrs(&ifaddr, -1, &(bool){false}) < 0) {
+		SYSERROR("Failed to get network interfaces");
 		return -1;
 	}
 
 	for (ifa = ifaddr, n = 0; ifa != NULL; ifa = ifa->ifa_next, n++) {
 		if (!ifa->ifa_addr)
 			continue;
+
 		if (ifa->ifa_addr->sa_family != AF_PACKET)
 			continue;
 
@@ -415,17 +351,17 @@ static int create_matched_ifnames(const char *value, struct lxc_conf *lxc_conf,
 				ret = set_config_net_link(
 				    link_key, ifa->ifa_name, lxc_conf, netdev);
 				if (ret) {
-					ERROR("failed to create matched ifnames");
+					ERROR("Failed to create matched ifnames");
 					break;
 				}
 			} else {
-				ERROR("failed to create matched ifnames");
+				ERROR("Failed to create matched ifnames");
 				break;
 			}
 		}
 	}
 
-	freeifaddrs(ifaddr);
+	netns_freeifaddrs(ifaddr);
 	ifaddr = NULL;
 
 	return ret;
@@ -446,7 +382,7 @@ static int set_config_net_link(const char *key, const char *value,
 	if (value[strlen(value) - 1] == '+' && netdev->type == LXC_NET_PHYS)
 		ret = create_matched_ifnames(value, lxc_conf, netdev);
 	else
-		ret = network_ifname(netdev->link, value);
+		ret = network_ifname(netdev->link, value, sizeof(netdev->link));
 
 	return ret;
 }
@@ -462,7 +398,7 @@ static int set_config_net_name(const char *key, const char *value,
 	if (!netdev)
 		return -1;
 
-	return network_ifname(netdev->name, value);
+	return network_ifname(netdev->name, value, sizeof(netdev->name));
 }
 
 static int set_config_net_veth_pair(const char *key, const char *value,
@@ -476,7 +412,7 @@ static int set_config_net_veth_pair(const char *key, const char *value,
 	if (!netdev)
 		return -1;
 
-	return network_ifname(netdev->priv.veth_attr.pair, value);
+	return network_ifname(netdev->priv.veth_attr.pair, value, sizeof(netdev->priv.veth_attr.pair));
 }
 
 static int set_config_net_macvlan_mode(const char *key, const char *value,
@@ -518,6 +454,7 @@ static int set_config_net_hwaddr(const char *key, const char *value,
 	}
 
 	netdev->hwaddr = new_value;
+
 	return 0;
 }
 
@@ -573,7 +510,6 @@ static int set_config_net_ipv4_address(const char *key, const char *value,
 	inetdev = malloc(sizeof(*inetdev));
 	if (!inetdev)
 		return -1;
-
 	memset(inetdev, 0, sizeof(*inetdev));
 
 	list = malloc(sizeof(*list));
@@ -628,8 +564,12 @@ static int set_config_net_ipv4_address(const char *key, const char *value,
 	/* No prefix specified, determine it from the network class. */
 	if (prefix) {
 		ret = lxc_safe_uint(prefix, &inetdev->prefix);
-		if (ret < 0)
+		if (ret < 0) {
+			free(inetdev);
+			free(list);
+			free(addr);
 			return -1;
+		}
 	} else {
 		inetdev->prefix = config_ip_prefix(&inetdev->addr);
 	}
@@ -643,8 +583,8 @@ static int set_config_net_ipv4_address(const char *key, const char *value,
 	}
 
 	lxc_list_add_tail(&netdev->ipv4, list);
-
 	free(addr);
+
 	return 0;
 }
 
@@ -704,7 +644,6 @@ static int set_config_net_ipv6_address(const char *key, const char *value,
 	inet6dev = malloc(sizeof(*inet6dev));
 	if (!inet6dev)
 		return -1;
-
 	memset(inet6dev, 0, sizeof(*inet6dev));
 
 	list = malloc(sizeof(*list));
@@ -728,6 +667,7 @@ static int set_config_net_ipv6_address(const char *key, const char *value,
 	if (slash) {
 		*slash = '\0';
 		netmask = slash + 1;
+
 		ret = lxc_safe_uint(netmask, &inet6dev->prefix);
 		if (ret < 0) {
 			free(list);
@@ -747,8 +687,8 @@ static int set_config_net_ipv6_address(const char *key, const char *value,
 	}
 
 	lxc_list_add_tail(&netdev->ipv6, list);
-
 	free(valdup);
+
 	return 0;
 }
 
@@ -830,6 +770,22 @@ static int add_hook(struct lxc_conf *lxc_conf, int which, char *hook)
 
 	hooklist->elem = hook;
 	lxc_list_add_tail(&lxc_conf->hooks[which], hooklist);
+
+	return 0;
+}
+
+static int set_config_seccomp_allow_nesting(const char *key, const char *value,
+					    struct lxc_conf *lxc_conf, void *data)
+{
+	if (lxc_config_value_empty(value))
+		return clr_config_seccomp_allow_nesting(key, lxc_conf, NULL);
+
+	if (lxc_safe_uint(value, &lxc_conf->seccomp_allow_nesting) < 0)
+		return -1;
+
+	if (lxc_conf->seccomp_allow_nesting > 1)
+		return -1;
+
 	return 0;
 }
 
@@ -932,6 +888,7 @@ static int set_config_hooks(const char *key, const char *value,
 		return add_hook(lxc_conf, LXCHOOK_DESTROY, copy);
 
 	free(copy);
+
 	return -1;
 }
 
@@ -955,6 +912,7 @@ static int set_config_hooks_version(const char *key, const char *value,
 	}
 
 	lxc_conf->hooks_version = tmp;
+
 	return 0;
 }
 
@@ -974,13 +932,19 @@ static int set_config_personality(const char *key, const char *value,
 static int set_config_pty_max(const char *key, const char *value,
 			      struct lxc_conf *lxc_conf, void *data)
 {
+	int ret;
+	unsigned int max = 0;
+
 	if (lxc_config_value_empty(value)) {
-		lxc_conf->pts = 0;
+		lxc_conf->pty_max = 0;
 		return 0;
 	}
 
-	if (lxc_safe_uint(value, &lxc_conf->pts) < 0)
+	ret = lxc_safe_uint(value, &max);
+	if (ret < 0)
 		return -1;
+
+	lxc_conf->pty_max = max;
 
 	return 0;
 }
@@ -1043,12 +1007,34 @@ static int set_config_monitor(const char *key, const char *value,
 	return -1;
 }
 
+static int set_config_monitor_signal_pdeath(const char *key, const char *value,
+					    struct lxc_conf *lxc_conf, void *data)
+{
+	if (lxc_config_value_empty(value)) {
+		lxc_conf->monitor_signal_pdeath = 0;
+		return 0;
+	}
+
+	if (strcmp(key + 12, "signal.pdeath") == 0) {
+		int sig_n;
+
+		sig_n = sig_parse(value);
+		if (sig_n < 0)
+			return -1;
+
+		lxc_conf->monitor_signal_pdeath = sig_n;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
 static int set_config_group(const char *key, const char *value,
 			    struct lxc_conf *lxc_conf, void *data)
 {
-	char *groups, *groupptr, *sptr, *token;
+	char *groups, *token;
 	struct lxc_list *grouplist;
-	int ret = -1;
+	int ret = 0;
 
 	if (lxc_config_value_empty(value))
 		return lxc_clear_groups(lxc_conf);
@@ -1060,20 +1046,17 @@ static int set_config_group(const char *key, const char *value,
 	/* In case several groups are specified in a single line split these
 	 * groups in a single element for the list.
 	 */
-	for (groupptr = groups;; groupptr = NULL) {
-		token = strtok_r(groupptr, " \t", &sptr);
-		if (!token) {
-			ret = 0;
+	lxc_iterate_parts(token, groups, " \t") {
+		grouplist = malloc(sizeof(*grouplist));
+		if (!grouplist) {
+			ret = -1;
 			break;
 		}
-
-		grouplist = malloc(sizeof(*grouplist));
-		if (!grouplist)
-			break;
 
 		grouplist->elem = strdup(token);
 		if (!grouplist->elem) {
 			free(grouplist);
+			ret = -1;
 			break;
 		}
 
@@ -1081,6 +1064,7 @@ static int set_config_group(const char *key, const char *value,
 	}
 
 	free(groups);
+
 	return ret;
 }
 
@@ -1096,7 +1080,21 @@ static int set_config_environment(const char *key, const char *value,
 	if (!list_item)
 		goto on_error;
 
-	list_item->elem = strdup(value);
+	if (!strchr(value, '=')) {
+		const char *env_val;
+		const char *env_key = value;
+		const char *env_var[3] = {0};
+
+		env_val = getenv(env_key);
+		if (!env_val)
+			goto on_error;
+
+		env_var[0] = env_key;
+		env_var[1] = env_val;
+		list_item->elem = lxc_string_join("=", env_var, false);
+	} else {
+		list_item->elem = strdup(value);
+	}
 
 	if (!list_item->elem)
 		goto on_error;
@@ -1107,24 +1105,34 @@ static int set_config_environment(const char *key, const char *value,
 
 on_error:
 	free(list_item);
+
 	return -1;
 }
 
 static int set_config_tty_max(const char *key, const char *value,
 			      struct lxc_conf *lxc_conf, void *data)
 {
+	int ret;
+	unsigned int nbtty = 0;
+
 	if (lxc_config_value_empty(value)) {
-		lxc_conf->tty = 0;
+		lxc_conf->ttys.max = 0;
 		return 0;
 	}
 
-	return lxc_safe_uint(value, &lxc_conf->tty);
+	ret = lxc_safe_uint(value, &nbtty);
+	if (ret < 0)
+		return -1;
+
+	lxc_conf->ttys.max = nbtty;
+
+	return 0;
 }
 
 static int set_config_tty_dir(const char *key, const char *value,
 			     struct lxc_conf *lxc_conf, void *data)
 {
-	return set_config_string_item_max(&lxc_conf->ttydir, value,
+	return set_config_string_item_max(&lxc_conf->ttys.dir, value,
 					  NAME_MAX + 1);
 }
 
@@ -1149,6 +1157,52 @@ static int set_config_apparmor_allow_incomplete(const char *key,
 
 	if (lxc_conf->lsm_aa_allow_incomplete > 1)
 		return -1;
+
+	return 0;
+}
+
+static int set_config_apparmor_allow_nesting(const char *key,
+					     const char *value,
+					     struct lxc_conf *lxc_conf,
+					     void *data)
+{
+	if (lxc_config_value_empty(value))
+		return clr_config_apparmor_allow_nesting(key, lxc_conf, NULL);
+
+	if (lxc_safe_uint(value, &lxc_conf->lsm_aa_allow_nesting) < 0)
+		return -1;
+
+	if (lxc_conf->lsm_aa_allow_nesting > 1)
+		return -1;
+
+	return 0;
+}
+
+static int set_config_apparmor_raw(const char *key,
+				   const char *value,
+				   struct lxc_conf *lxc_conf,
+				   void *data)
+{
+	char *elem;
+	struct lxc_list *list;
+
+	if (lxc_config_value_empty(value))
+		return lxc_clear_apparmor_raw(lxc_conf);
+
+	list = malloc(sizeof(*list));
+	if (!list) {
+		errno = ENOMEM;
+		return -1;
+	}
+
+	elem = strdup(value);
+	if (!elem) {
+		free(list);
+		return -1;
+	}
+	list->elem = elem;
+
+	lxc_list_add_tail(&lxc_conf->lsm_aa_raw, list);
 
 	return 0;
 }
@@ -1201,6 +1255,7 @@ static int set_config_log_level(const char *key, const char *value,
 	 * current logging.
 	 */
 	lxc_conf->loglevel = newlevel;
+
 	return lxc_log_set_level(&lxc_conf->loglevel, newlevel);
 }
 
@@ -1219,55 +1274,6 @@ static int set_config_autodev(const char *key, const char *value,
 		return -1;
 
 	return 0;
-}
-
-static int sig_num(const char *sig)
-{
-	unsigned int signum;
-
-	if (lxc_safe_uint(sig, &signum) < 0)
-		return -1;
-
-	return signum;
-}
-
-static int rt_sig_num(const char *signame)
-{
-	int rtmax = 0, sig_n = 0;
-
-	if (strncasecmp(signame, "max-", 4) == 0) {
-		rtmax = 1;
-	}
-
-	signame += 4;
-	if (!isdigit(*signame))
-		return -1;
-
-	sig_n = sig_num(signame);
-	sig_n = rtmax ? SIGRTMAX - sig_n : SIGRTMIN + sig_n;
-	if (sig_n > SIGRTMAX || sig_n < SIGRTMIN)
-		return -1;
-
-	return sig_n;
-}
-
-static int sig_parse(const char *signame)
-{
-	size_t n;
-
-	if (isdigit(*signame)) {
-		return sig_num(signame);
-	} else if (strncasecmp(signame, "sig", 3) == 0) {
-		signame += 3;
-		if (strncasecmp(signame, "rt", 2) == 0)
-			return rt_sig_num(signame + 2);
-		for (n = 0; n < sizeof(signames) / sizeof((signames)[0]); n++) {
-			if (strcasecmp(signames[n].name, signame) == 0)
-				return signames[n].num;
-		}
-	}
-
-	return -1;
 }
 
 static int set_config_signal_halt(const char *key, const char *value,
@@ -1418,6 +1424,52 @@ static int set_config_cgroup_dir(const char *key, const char *value,
 	return set_config_string_item(&lxc_conf->cgroup_meta.dir, value);
 }
 
+static int set_config_cgroup_relative(const char *key, const char *value,
+				      struct lxc_conf *lxc_conf, void *data)
+{
+	unsigned int converted;
+	int ret;
+
+	if (lxc_config_value_empty(value))
+		return clr_config_cgroup_relative(key, lxc_conf, NULL);
+
+	ret = lxc_safe_uint(value, &converted);
+	if (ret < 0)
+		return -ret;
+
+	if (converted == 1) {
+		lxc_conf->cgroup_meta.relative = true;
+		return 0;
+	}
+
+	if (converted == 0) {
+		lxc_conf->cgroup_meta.relative = false;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static bool parse_limit_value(const char **value, rlim_t *res)
+{
+	char *endptr = NULL;
+
+	if (strncmp(*value, "unlimited", STRLITERALLEN("unlimited")) == 0) {
+		*res = RLIM_INFINITY;
+		*value += STRLITERALLEN("unlimited");
+		return true;
+	}
+
+	errno = 0;
+	*res = strtoull(*value, &endptr, 10);
+	if (errno || !endptr)
+		return false;
+
+	*value = endptr;
+
+	return true;
+}
+
 static int set_config_prlimit(const char *key, const char *value,
 			    struct lxc_conf *lxc_conf, void *data)
 {
@@ -1430,14 +1482,15 @@ static int set_config_prlimit(const char *key, const char *value,
 	if (lxc_config_value_empty(value))
 		return lxc_clear_limits(lxc_conf, key);
 
-	if (strncmp(key, "lxc.prlimit.", sizeof("lxc.prlimit.") - 1) != 0)
+	if (strncmp(key, "lxc.prlimit.", STRLITERALLEN("lxc.prlimit.")) != 0)
 		return -1;
 
-	key += sizeof("lxc.prlimit.") - 1;
+	key += STRLITERALLEN("lxc.prlimit.");
 
 	/* soft limit comes first in the value */
 	if (!parse_limit_value(&value, &limit_value))
 		return -1;
+
 	limit.rlim_cur = limit_value;
 
 	/* skip spaces and a colon */
@@ -1456,6 +1509,7 @@ static int set_config_prlimit(const char *key, const char *value,
 	if (*value) {
 		if (!parse_limit_value(&value, &limit_value))
 			return -1;
+
 		limit.rlim_max = limit_value;
 
 		/* check for trailing garbage */
@@ -1491,20 +1545,21 @@ static int set_config_prlimit(const char *key, const char *value,
 	limelem->resource = strdup(key);
 	if (!limelem->resource)
 		goto on_error;
+
 	limelem->limit = limit;
-
 	lxc_list_add_elem(limlist, limelem);;
-
 	lxc_list_add_tail(&lxc_conf->limits, limlist);
 
 	return 0;
 
 on_error:
 	free(limlist);
+
 	if (limelem) {
 		free(limelem->resource);
 		free(limelem);
 	}
+
 	return -1;
 }
 
@@ -1519,10 +1574,10 @@ static int set_config_sysctl(const char *key, const char *value,
 	if (lxc_config_value_empty(value))
 		return clr_config_sysctl(key, lxc_conf, NULL);
 
-	if (strncmp(key, "lxc.sysctl.", sizeof("lxc.sysctl.") - 1) != 0)
+	if (strncmp(key, "lxc.sysctl.", STRLITERALLEN("lxc.sysctl.")) != 0)
 		return -1;
 
-	key += sizeof("lxc.sysctl.") - 1;
+	key += STRLITERALLEN("lxc.sysctl.");
 
 	/* find existing list element */
 	lxc_list_for_each(iter, &lxc_conf->sysctls) {
@@ -1537,6 +1592,7 @@ static int set_config_sysctl(const char *key, const char *value,
 
 		free(sysctl_elem->value);
 		sysctl_elem->value = replace_value;
+
 		return 0;
 	}
 
@@ -1559,18 +1615,19 @@ static int set_config_sysctl(const char *key, const char *value,
 		goto on_error;
 
 	lxc_list_add_elem(sysctl_list, sysctl_elem);
-
 	lxc_list_add_tail(&lxc_conf->sysctls, sysctl_list);
 
 	return 0;
 
 on_error:
 	free(sysctl_list);
+
 	if (sysctl_elem) {
 		free(sysctl_elem->key);
 		free(sysctl_elem->value);
 		free(sysctl_elem);
 	}
+
 	return -1;
 }
 
@@ -1584,10 +1641,10 @@ static int set_config_proc(const char *key, const char *value,
 	if (lxc_config_value_empty(value))
 		return clr_config_proc(key, lxc_conf, NULL);
 
-	if (strncmp(key, "lxc.proc.", sizeof("lxc.proc.") -1) != 0)
+	if (strncmp(key, "lxc.proc.", STRLITERALLEN("lxc.proc.")) != 0)
 		return -1;
 
-	subkey = key + sizeof("lxc.proc.") - 1;
+	subkey = key + STRLITERALLEN("lxc.proc.");
 	if (*subkey == '\0')
 		return -EINVAL;
 
@@ -1614,6 +1671,7 @@ static int set_config_proc(const char *key, const char *value,
 
 on_error:
 	free(proclist);
+
 	if (procelem) {
 		free(procelem->filename);
 		free(procelem->value);
@@ -1668,7 +1726,6 @@ static int set_config_idmaps(const char *key, const char *value,
 		if (idmap->nsid == 0)
 			lxc_conf->root_nsuid_map = idmap;
 
-
 	if (!lxc_conf->root_nsgid_map && idmap->idtype == ID_TYPE_GID)
 		if (idmap->nsid == 0)
 			lxc_conf->root_nsgid_map = idmap;
@@ -1698,7 +1755,7 @@ static int set_config_mount_fstab(const char *key, const char *value,
 static int set_config_mount_auto(const char *key, const char *value,
 				 struct lxc_conf *lxc_conf, void *data)
 {
-	char *autos, *autoptr, *sptr, *token;
+	char *autos, *token;
 	int i;
 	int ret = -1;
 	static struct {
@@ -1729,6 +1786,7 @@ static int set_config_mount_auto(const char *key, const char *value,
 	    { "cgroup-full:mixed:force", LXC_AUTO_CGROUP_MASK, LXC_AUTO_CGROUP_FULL_MIXED | LXC_AUTO_CGROUP_FORCE  },
 	    { "cgroup-full:ro:force",    LXC_AUTO_CGROUP_MASK, LXC_AUTO_CGROUP_FULL_RO | LXC_AUTO_CGROUP_FORCE     },
 	    { "cgroup-full:rw:force",    LXC_AUTO_CGROUP_MASK, LXC_AUTO_CGROUP_FULL_RW | LXC_AUTO_CGROUP_FORCE     },
+	    { "shmounts:",               LXC_AUTO_SHMOUNTS_MASK, LXC_AUTO_SHMOUNTS                                 },
 	    /* For adding anything that is just a single on/off, but has no
 	    *  options: keep mask and flag identical and just define the enum
 	    *  value as an unused bit so far
@@ -1745,28 +1803,63 @@ static int set_config_mount_auto(const char *key, const char *value,
 	if (!autos)
 		return -1;
 
-	for (autoptr = autos;; autoptr = NULL) {
-		token = strtok_r(autoptr, " \t", &sptr);
-		if (!token) {
-			ret = 0;
-			break;
-		}
+	lxc_iterate_parts(token, autos, " \t") {
+		bool is_shmounts = false;
 
 		for (i = 0; allowed_auto_mounts[i].token; i++) {
 			if (!strcmp(allowed_auto_mounts[i].token, token))
 				break;
+
+			if (strcmp("shmounts:", allowed_auto_mounts[i].token) == 0 &&
+			    strncmp("shmounts:", token, STRLITERALLEN("shmounts:")) == 0) {
+				is_shmounts = true;
+				break;
+			}
 		}
 
 		if (!allowed_auto_mounts[i].token) {
 			ERROR("Invalid filesystem to automount \"%s\"", token);
-			break;
+			goto on_error;
 		}
 
 		lxc_conf->auto_mounts &= ~allowed_auto_mounts[i].mask;
 		lxc_conf->auto_mounts |= allowed_auto_mounts[i].flag;
+
+		if (is_shmounts) {
+			char *container_path;
+			char *host_path;
+
+			host_path = token + STRLITERALLEN("shmounts:");
+			if (*host_path == '\0') {
+				SYSERROR("Failed to copy shmounts host path");
+				goto on_error;
+			}
+
+			container_path = strchr(host_path, ':');
+			if (!container_path || *(container_path + 1) == '\0')
+				container_path = "/dev/.lxc-mounts";
+			else
+				*container_path++ = '\0';
+
+			lxc_conf->shmount.path_host = strdup(host_path);
+			if (!lxc_conf->shmount.path_host) {
+				SYSERROR("Failed to copy shmounts host path");
+				goto on_error;
+			}
+
+			lxc_conf->shmount.path_cont = strdup(container_path);
+			if(!lxc_conf->shmount.path_cont) {
+				SYSERROR("Failed to copy shmounts container path");
+				goto on_error;
+			}
+		}
 	}
 
+	ret = 0;
+
+on_error:
 	free(autos);
+
 	return ret;
 }
 
@@ -1795,10 +1888,14 @@ static int set_config_mount(const char *key, const char *value,
 	return 0;
 }
 
+int add_elem_to_mount_list(const char *value, struct lxc_conf *lxc_conf) {
+	return set_config_mount(NULL, value, lxc_conf, NULL);
+}
+
 static int set_config_cap_keep(const char *key, const char *value,
 			       struct lxc_conf *lxc_conf, void *data)
 {
-	char *keepcaps, *keepptr, *sptr, *token;
+	char *keepcaps, *token;
 	struct lxc_list *keeplist;
 	int ret = -1;
 
@@ -1812,29 +1909,26 @@ static int set_config_cap_keep(const char *key, const char *value,
 	/* In case several capability keep is specified in a single line
 	 * split these caps in a single element for the list.
 	 */
-	for (keepptr = keepcaps;; keepptr = NULL) {
-		token = strtok_r(keepptr, " \t", &sptr);
-		if (!token) {
-			ret = 0;
-			break;
-		}
-
+	lxc_iterate_parts(token, keepcaps, " \t") {
 		if (!strcmp(token, "none"))
 			lxc_clear_config_keepcaps(lxc_conf);
 
 		keeplist = malloc(sizeof(*keeplist));
 		if (!keeplist)
-			break;
+			goto on_error;
 
 		keeplist->elem = strdup(token);
 		if (!keeplist->elem) {
 			free(keeplist);
-			break;
+			goto on_error;
 		}
 
 		lxc_list_add_tail(&lxc_conf->keepcaps, keeplist);
 	}
 
+	ret = 0;
+
+on_error:
 	free(keepcaps);
 
 	return ret;
@@ -1843,7 +1937,7 @@ static int set_config_cap_keep(const char *key, const char *value,
 static int set_config_cap_drop(const char *key, const char *value,
 			       struct lxc_conf *lxc_conf, void *data)
 {
-	char *dropcaps, *dropptr, *sptr, *token;
+	char *dropcaps, *token;
 	struct lxc_list *droplist;
 	int ret = -1;
 
@@ -1857,26 +1951,23 @@ static int set_config_cap_drop(const char *key, const char *value,
 	/* In case several capability drop is specified in a single line
 	 * split these caps in a single element for the list.
 	 */
-	for (dropptr = dropcaps;; dropptr = NULL) {
-		token = strtok_r(dropptr, " \t", &sptr);
-		if (!token) {
-			ret = 0;
-			break;
-		}
-
+	lxc_iterate_parts(token, dropcaps, " \t") {
 		droplist = malloc(sizeof(*droplist));
 		if (!droplist)
-			break;
+			goto on_error;
 
 		droplist->elem = strdup(token);
 		if (!droplist->elem) {
 			free(droplist);
-			break;
+			goto on_error;
 		}
 
 		lxc_list_add_tail(&lxc_conf->caps, droplist);
 	}
 
+        ret = 0;
+
+on_error:
 	free(dropcaps);
 
 	return ret;
@@ -1958,6 +2049,7 @@ static int set_config_console_buffer_size(const char *key, const char *value,
 		       "next power of two: %" PRIu64 " bytes", buffer_size);
 
 	lxc_conf->console.buffer_size = buffer_size;
+
 	return 0;
 }
 
@@ -2005,15 +2097,52 @@ static int set_config_console_size(const char *key, const char *value,
 		       "next power of two: %" PRIu64 " bytes", log_size);
 
 	lxc_conf->console.log_size = log_size;
+
 	return 0;
+}
+
+/*
+ * If we find a lxc.net.[i].hwaddr or lxc.network.hwaddr in the original config
+ * file, we expand it in the unexpanded_config, so that after a save_config we
+ * store the hwaddr for re-use.
+ * This is only called when reading the config file, not when executing a
+ * lxc.include.
+ * 'x' and 'X' are substituted in-place.
+ */
+static void update_hwaddr(const char *line)
+{
+	char *p;
+
+	line += lxc_char_left_gc(line, strlen(line));
+	if (line[0] == '#')
+		return;
+
+	if (!lxc_config_net_is_hwaddr(line))
+		return;
+
+	/* Let config_net_hwaddr raise the error. */
+	p = strchr(line, '=');
+	if (!p)
+		return;
+	p++;
+
+	while (isblank(*p))
+		p++;
+
+	if (!*p)
+		return;
+
+	rand_complete_hwaddr(p);
 }
 
 int append_unexp_config_line(const char *line, struct lxc_conf *conf)
 {
-	size_t len = conf->unexpanded_len, linelen = strlen(line);
+	size_t linelen;
+	size_t len = conf->unexpanded_len;
 
 	update_hwaddr(line);
 
+	linelen = strlen(line);
 	while (conf->unexpanded_alloced <= len + linelen + 2) {
 		char *tmp = realloc(conf->unexpanded_config,
 				    conf->unexpanded_alloced + 1024);
@@ -2022,15 +2151,16 @@ int append_unexp_config_line(const char *line, struct lxc_conf *conf)
 
 		if (!conf->unexpanded_config)
 			*tmp = '\0';
+
 		conf->unexpanded_config = tmp;
 		conf->unexpanded_alloced += 1024;
 	}
-	strcat(conf->unexpanded_config, line);
+
+	memcpy(conf->unexpanded_config + conf->unexpanded_len, line, linelen);
 	conf->unexpanded_len += linelen;
-	if (line[linelen - 1] != '\n') {
-		strcat(conf->unexpanded_config, "\n");
-		conf->unexpanded_len++;
-	}
+	if (line[linelen - 1] != '\n')
+		conf->unexpanded_config[conf->unexpanded_len++] = '\n';
+	conf->unexpanded_config[conf->unexpanded_len] = '\0';
 
 	return 0;
 }
@@ -2039,7 +2169,7 @@ static int do_includedir(const char *dirp, struct lxc_conf *lxc_conf)
 {
 	struct dirent *direntp;
 	DIR *dir;
-	char path[MAXPATHLEN];
+	char path[PATH_MAX];
 	int len;
 	int ret = -1;
 
@@ -2049,8 +2179,6 @@ static int do_includedir(const char *dirp, struct lxc_conf *lxc_conf)
 
 	while ((direntp = readdir(dir))) {
 		const char *fnam;
-		if (!direntp)
-			break;
 
 		fnam = direntp->d_name;
 		if (!strcmp(fnam, "."))
@@ -2063,8 +2191,8 @@ static int do_includedir(const char *dirp, struct lxc_conf *lxc_conf)
 		if (len < 6 || strncmp(fnam + len - 5, ".conf", 5) != 0)
 			continue;
 
-		len = snprintf(path, MAXPATHLEN, "%s/%s", dirp, fnam);
-		if (len < 0 || len >= MAXPATHLEN) {
+		len = snprintf(path, PATH_MAX, "%s/%s", dirp, fnam);
+		if (len < 0 || len >= PATH_MAX) {
 			ret = -1;
 			goto out;
 		}
@@ -2119,11 +2247,13 @@ static int set_config_rootfs_path(const char *key, const char *value,
 	tmp = strchr(dup, ':');
 	if (tmp) {
 		*tmp = '\0';
+
 		ret = set_config_path_item(&lxc_conf->rootfs.bdev_type, dup);
 		if (ret < 0) {
 			free(dup);
 			return -1;
 		}
+
 		tmp++;
 		container_path = tmp;
 	} else {
@@ -2132,7 +2262,33 @@ static int set_config_rootfs_path(const char *key, const char *value,
 
 	ret = set_config_path_item(&lxc_conf->rootfs.path, container_path);
 	free(dup);
+
 	return ret;
+}
+
+static int set_config_rootfs_managed(const char *key, const char *value,
+				     struct lxc_conf *lxc_conf, void *data)
+{
+	unsigned int val = 0;
+
+	if (lxc_config_value_empty(value)) {
+		lxc_conf->rootfs.managed = true;
+		return 0;
+	}
+
+	if (lxc_safe_uint(value, &val) < 0)
+		return -EINVAL;
+
+	switch (val) {
+	case 0:
+		lxc_conf->rootfs.managed = false;
+		return 0;
+	case 1:
+		lxc_conf->rootfs.managed = true;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 static int set_config_rootfs_mount(const char *key, const char *value,
@@ -2144,7 +2300,32 @@ static int set_config_rootfs_mount(const char *key, const char *value,
 static int set_config_rootfs_options(const char *key, const char *value,
 				     struct lxc_conf *lxc_conf, void *data)
 {
-	return set_config_string_item(&lxc_conf->rootfs.options, value);
+	int ret;
+	unsigned long mflags = 0, pflags = 0;
+	char *mdata = NULL, *opts = NULL;
+	struct lxc_rootfs *rootfs = &lxc_conf->rootfs;
+
+	ret = parse_mntopts(value, &mflags, &mdata);
+	if (ret < 0)
+		return -EINVAL;
+
+	ret = parse_propagationopts(value, &pflags);
+	if (ret < 0) {
+		free(mdata);
+		return -EINVAL;
+	}
+
+	ret = set_config_string_item(&opts, value);
+	if (ret < 0) {
+		free(mdata);
+		return -ENOMEM;
+	}
+
+	rootfs->mountflags = mflags | pflags;
+	rootfs->options = opts;
+	rootfs->data = mdata;
+
+	return 0;
 }
 
 static int set_config_uts_name(const char *key, const char *value,
@@ -2166,7 +2347,7 @@ static int set_config_uts_name(const char *key, const char *value,
 		return -1;
 	}
 
-	strcpy(utsname->nodename, value);
+	(void)strlcpy(utsname->nodename, value, sizeof(utsname->nodename));
 	free(lxc_conf->utsname);
 	lxc_conf->utsname = utsname;
 
@@ -2176,25 +2357,24 @@ static int set_config_uts_name(const char *key, const char *value,
 static int set_config_namespace_clone(const char *key, const char *value,
 				      struct lxc_conf *lxc_conf, void *data)
 {
-	char *ns, *nsptr, *token;
+	char *ns, *token;
 	int cloneflag = 0;
-	char *saveptr = NULL;
 
 	if (lxc_config_value_empty(value))
 		return clr_config_namespace_clone(key, lxc_conf, data);
 
 	if (lxc_conf->ns_keep != 0) {
-		ERROR("%s - Cannot set both \"lxc.namespace.clone\" and "
-		      "\"lxc.namespace.keep\"", strerror(EINVAL));
+		errno = EINVAL;
+		SYSERROR("Cannot set both \"lxc.namespace.clone\" and "
+		         "\"lxc.namespace.keep\"");
 		return -EINVAL;
 	}
 
 	ns = strdup(value);
 	if (!ns)
 		return -1;
-	nsptr = ns;
 
-	for (; (token = strtok_r(nsptr, " \t", &saveptr)); nsptr = NULL) {
+	lxc_iterate_parts(token, ns, " \t") {
 		token += lxc_char_left_gc(token, strlen(token));
 		token[lxc_char_right_gc(token, strlen(token))] = '\0';
 		cloneflag = lxc_namespace_2_cloneflag(token);
@@ -2212,25 +2392,24 @@ static int set_config_namespace_clone(const char *key, const char *value,
 static int set_config_namespace_keep(const char *key, const char *value,
 				     struct lxc_conf *lxc_conf, void *data)
 {
-	char *ns, *nsptr, *token;
+	char *ns, *token;
 	int cloneflag = 0;
-	char *saveptr = NULL;
 
 	if (lxc_config_value_empty(value))
 		return clr_config_namespace_keep(key, lxc_conf, data);
 
 	if (lxc_conf->ns_clone != 0) {
-		ERROR("%s - Cannot set both \"lxc.namespace.clone\" and "
-		      "\"lxc.namespace.keep\"", strerror(EINVAL));
+		errno = EINVAL;
+		SYSERROR("Cannot set both \"lxc.namespace.clone\" and "
+		         "\"lxc.namespace.keep\"");
 		return -EINVAL;
 	}
 
 	ns = strdup(value);
 	if (!ns)
 		return -1;
-	nsptr = ns;
 
-	for (; (token = strtok_r(nsptr, " \t", &saveptr)); nsptr = NULL) {
+	lxc_iterate_parts(token, ns, " \t") {
 		token += lxc_char_left_gc(token, strlen(token));
 		token[lxc_char_right_gc(token, strlen(token))] = '\0';
 		cloneflag = lxc_namespace_2_cloneflag(token);
@@ -2254,7 +2433,7 @@ static int set_config_namespace_share(const char *key, const char *value,
 	if (lxc_config_value_empty(value))
 		return clr_config_namespace_share(key, lxc_conf, data);
 
-	namespace = key + sizeof("lxc.namespace.share.") - 1;
+	namespace = key + STRLITERALLEN("lxc.namespace.share.");
 	ns_idx = lxc_namespace_2_ns_idx(namespace);
 	if (ns_idx < 0)
 		return ns_idx;
@@ -2345,30 +2524,84 @@ static int parse_line(char *buffer, void *data)
 
 on_error:
 	free(linep);
+
 	return ret;
 }
 
-static int lxc_config_readline(char *buffer, struct lxc_conf *conf)
+static struct new_config_item *parse_new_conf_line(char *buffer)
 {
-	struct parse_line_conf c;
+	char *dot, *key, *line, *linep, *value;
+	int ret = 0;
+	char *dup = buffer;
+	struct new_config_item *new = NULL;
 
-	c.conf = conf;
-	c.from_include = false;
+	linep = line = strdup(dup);
+	if (!line)
+		return NULL;
 
-	return parse_line(buffer, &c);
+	line += lxc_char_left_gc(line, strlen(line));
+
+	/* martian option - don't add it to the config itself */
+	if (strncmp(line, "lxc.", 4))
+		goto on_error;
+
+	ret = -1;
+	dot = strchr(line, '=');
+	if (!dot) {
+		ERROR("Invalid configuration item: %s", line);
+		goto on_error;
+	}
+
+	*dot = '\0';
+	value = dot + 1;
+
+	key = line;
+	key[lxc_char_right_gc(key, strlen(key))] = '\0';
+
+	value += lxc_char_left_gc(value, strlen(value));
+	value[lxc_char_right_gc(value, strlen(value))] = '\0';
+
+	if (*value == '\'' || *value == '\"') {
+		size_t len;
+
+		len = strlen(value);
+		if (len > 1 && value[len - 1] == *value) {
+			value[len - 1] = '\0';
+			value++;
+		}
+	}
+
+	ret = -1;
+	new = malloc(sizeof(struct new_config_item));
+	if (!new)
+		goto on_error;
+
+	new->key = strdup(key);
+	new->val = strdup(value);
+	if (!new->val || !new->key)
+		goto on_error;
+
+	ret = 0;
+
+on_error:
+	free(linep);
+
+	if (ret < 0 && new) {
+		free(new->key);
+		free(new->val);
+		free(new);
+		new = NULL;
+	}
+
+	return new;
 }
 
 int lxc_config_read(const char *file, struct lxc_conf *conf, bool from_include)
 {
-	int ret;
 	struct parse_line_conf c;
 
 	c.conf = conf;
 	c.from_include = from_include;
-
-	ret = access(file, R_OK);
-	if (ret < 0)
-		return -1;
 
 	/* Catch only the top level config file name in the structure. */
 	if (!conf->rcfile)
@@ -2385,28 +2618,45 @@ int lxc_config_define_add(struct lxc_list *defines, char *arg)
 	if (!dent)
 		return -1;
 
-	dent->elem = arg;
+	dent->elem = parse_new_conf_line(arg);
+	if (!dent->elem) {
+		free(dent);
+		return -1;
+	}
+
 	lxc_list_add_tail(defines, dent);
+
 	return 0;
 }
 
-int lxc_config_define_load(struct lxc_list *defines, struct lxc_conf *conf)
+bool lxc_config_define_load(struct lxc_list *defines, struct lxc_container *c)
 {
-	struct lxc_list *it, *next;
-	int ret = 0;
+	struct lxc_list *it;
+	bool bret = true;
 
 	lxc_list_for_each(it, defines) {
-		ret = lxc_config_readline(it->elem, conf);
-		if (ret)
+		struct new_config_item *new_item = it->elem;
+		bret = c->set_config_item(c, new_item->key, new_item->val);
+		if (!bret)
 			break;
 	}
 
+	lxc_config_define_free(defines);
+
+	return bret;
+}
+
+void lxc_config_define_free(struct lxc_list *defines)
+{
+	struct lxc_list *it, *next;
+
 	lxc_list_for_each_safe(it, defines, next) {
+		struct new_config_item *new_item = it->elem;
+		free(new_item->key);
+		free(new_item->val);
 		lxc_list_del(it);
 		free(it);
 	}
-
-	return ret;
 }
 
 signed long lxc_config_parse_arch(const char *arch)
@@ -2417,43 +2667,81 @@ signed long lxc_config_parse_arch(const char *arch)
 		char *name;
 		unsigned long per;
 	} pername[] = {
-	    { "x86",       PER_LINUX32 },
-	    { "linux32",   PER_LINUX32 },
+	    { "arm",       PER_LINUX32 },
+	    { "armel",     PER_LINUX32 },
+	    { "armhf",     PER_LINUX32 },
+	    { "armv7l",    PER_LINUX32 },
+	    { "athlon",    PER_LINUX32 },
 	    { "i386",      PER_LINUX32 },
 	    { "i486",      PER_LINUX32 },
 	    { "i586",      PER_LINUX32 },
 	    { "i686",      PER_LINUX32 },
-	    { "athlon",    PER_LINUX32 },
+	    { "linux32",   PER_LINUX32 },
 	    { "mips",      PER_LINUX32 },
 	    { "mipsel",    PER_LINUX32 },
 	    { "ppc",       PER_LINUX32 },
-	    { "arm",       PER_LINUX32 },
-	    { "armv7l",    PER_LINUX32 },
-	    { "armhf",     PER_LINUX32 },
-	    { "armel",     PER_LINUX32 },
 	    { "powerpc",   PER_LINUX32 },
-	    { "linux64",   PER_LINUX   },
-	    { "x86_64",    PER_LINUX   },
+	    { "x86",       PER_LINUX32 },
 	    { "amd64",     PER_LINUX   },
+	    { "arm64",     PER_LINUX   },
+	    { "linux64",   PER_LINUX   },
 	    { "mips64",    PER_LINUX   },
 	    { "mips64el",  PER_LINUX   },
 	    { "ppc64",     PER_LINUX   },
-	    { "ppc64le",   PER_LINUX   },
 	    { "ppc64el",   PER_LINUX   },
+	    { "ppc64le",   PER_LINUX   },
 	    { "powerpc64", PER_LINUX   },
 	    { "s390x",     PER_LINUX   },
-	    { "aarch64",   PER_LINUX   },
-	    { "arm64",     PER_LINUX   },
+	    { "x86_64",    PER_LINUX   },
 	};
 	size_t len = sizeof(pername) / sizeof(pername[0]);
 
-	for (i = 0; i < len; i++) {
+	for (i = 0; i < len; i++)
 		if (!strcmp(pername[i].name, arch))
 			return pername[i].per;
-	}
 #endif
 
 	return -1;
+}
+
+int lxc_fill_elevated_privileges(char *flaglist, int *flags)
+{
+	char *token;
+	int i, aflag;
+	struct {
+		const char *token;
+		int flag;
+	} all_privs[] = {
+		{ "CGROUP", LXC_ATTACH_MOVE_TO_CGROUP    },
+		{ "CAP",    LXC_ATTACH_DROP_CAPABILITIES },
+		{ "LSM",    LXC_ATTACH_LSM_EXEC          },
+		{ NULL,     0                            }
+	};
+
+	if (!flaglist) {
+		/* For the sake of backward compatibility, drop all privileges
+		*  if none is specified.
+		 */
+		for (i = 0; all_privs[i].token; i++)
+			*flags |= all_privs[i].flag;
+
+		return 0;
+	}
+
+	lxc_iterate_parts(token, flaglist, "|") {
+		aflag = -1;
+
+		for (i = 0; all_privs[i].token; i++)
+			if (!strcmp(all_privs[i].token, token))
+				aflag = all_privs[i].flag;
+
+		if (aflag < 0)
+			return -1;
+
+		*flags |= aflag;
+	}
+
+	return 0;
 }
 
 /* Write out a configuration file. */
@@ -2477,12 +2765,12 @@ int write_config(int fd, const struct lxc_conf *conf)
 bool do_append_unexp_config_line(struct lxc_conf *conf, const char *key,
 				 const char *v)
 {
+	__do_free char *tmp = NULL;
 	int ret;
 	size_t len;
-	char *tmp;
 
 	len = strlen(key) + strlen(v) + 4;
-	tmp = alloca(len);
+	tmp = must_realloc(NULL, len);
 
 	if (lxc_config_value_empty(v))
 		ret = snprintf(tmp, len, "%s =", key);
@@ -2510,14 +2798,17 @@ void clear_unexp_config_line(struct lxc_conf *conf, const char *key,
 	while (*lstart) {
 		lend = strchr(lstart, '\n');
 		char v;
+
 		if (!lend)
 			lend = lstart + strlen(lstart);
 		else
 			lend++;
+
 		if (strncmp(lstart, key, strlen(key)) != 0) {
 			lstart = lend;
 			continue;
 		}
+
 		if (!rm_subkeys) {
 			v = lstart[strlen(key)];
 			if (!isspace(v) && v != '=') {
@@ -2525,11 +2816,14 @@ void clear_unexp_config_line(struct lxc_conf *conf, const char *key,
 				continue;
 			}
 		}
+
 		conf->unexpanded_len -= (lend - lstart);
+
 		if (*lend == '\0') {
 			*lstart = '\0';
 			return;
 		}
+
 		memmove(lstart, lend, strlen(lend) + 1);
 	}
 }
@@ -2538,21 +2832,23 @@ bool clone_update_unexp_ovl_paths(struct lxc_conf *conf, const char *oldpath,
 				  const char *newpath, const char *oldname,
 				  const char *newname, const char *ovldir)
 {
+	__do_free char *newdir = NULL,
+							 *olddir = NULL;
 	int ret;
-	char *lend, *newdir, *olddir, *p, *q;
+	char *lend, *p, *q;
 	size_t newdirlen, olddirlen;
 	char *lstart = conf->unexpanded_config;
 	const char *key = "lxc.mount.entry";
 
 	olddirlen = strlen(ovldir) + strlen(oldpath) + strlen(oldname) + 2;
-	olddir = alloca(olddirlen + 1);
+	olddir = must_realloc(NULL, olddirlen + 1);
 	ret = snprintf(olddir, olddirlen + 1, "%s=%s/%s", ovldir, oldpath,
 		       oldname);
 	if (ret < 0 || ret >= olddirlen + 1)
 		return false;
 
 	newdirlen = strlen(ovldir) + strlen(newpath) + strlen(newname) + 2;
-	newdir = alloca(newdirlen + 1);
+	newdir = must_realloc(NULL, newdirlen + 1);
 	ret = snprintf(newdir, newdirlen + 1, "%s=%s/%s", ovldir, newpath,
 		       newname);
 	if (ret < 0 || ret >= newdirlen + 1)
@@ -2601,9 +2897,10 @@ bool clone_update_unexp_ovl_paths(struct lxc_conf *conf, const char *oldpath,
 		if (olddirlen >= newdirlen) {
 			size_t diff = olddirlen - newdirlen;
 			memcpy(q, newdir, newdirlen);
+
 			if (olddirlen != newdirlen) {
 				memmove(q + newdirlen, q + newdirlen + diff,
-					strlen(q) - newdirlen - diff + 1);
+				        strlen(q) - newdirlen - diff + 1);
 				lend -= diff;
 				conf->unexpanded_len -= diff;
 			}
@@ -2622,15 +2919,18 @@ bool clone_update_unexp_ovl_paths(struct lxc_conf *conf, const char *oldpath,
 			conf->unexpanded_alloced = newlen + 1;
 			new[newlen - 1] = '\0';
 			lend = new + (lend - conf->unexpanded_config);
+
 			/* Move over the remainder to make room for the newdir.
 			 */
 			memmove(new + poffset + newdirlen,
-				new + poffset + olddirlen,
-				oldlen - poffset - olddirlen + 1);
+			        new + poffset + olddirlen,
+			        oldlen - poffset - olddirlen + 1);
 			conf->unexpanded_config = new;
+
 			memcpy(new + poffset, newdir, newdirlen);
 			lend += diff;
 		}
+
 	next:
 		lstart = lend;
 	}
@@ -2642,20 +2942,22 @@ bool clone_update_unexp_hooks(struct lxc_conf *conf, const char *oldpath,
 			      const char *newpath, const char *oldname,
 			      const char *newname)
 {
+	__do_free char *newdir = NULL,
+							 *olddir = NULL;
 	int ret;
-	char *lend, *newdir, *olddir, *p;
+	char *lend, *p;
 	char *lstart = conf->unexpanded_config;
 	size_t newdirlen, olddirlen;
 	const char *key = "lxc.hook";
 
 	olddirlen = strlen(oldpath) + strlen(oldname) + 1;
-	olddir = alloca(olddirlen + 1);
+	olddir = must_realloc(NULL, olddirlen + 1);
 	ret = snprintf(olddir, olddirlen + 1, "%s/%s", oldpath, oldname);
 	if (ret < 0 || ret >= olddirlen + 1)
 		return false;
 
 	newdirlen = strlen(newpath) + strlen(newname) + 1;
-	newdir = alloca(newdirlen + 1);
+	newdir = must_realloc(NULL, newdirlen + 1);
 	ret = snprintf(newdir, newdirlen + 1, "%s/%s", newpath, newname);
 	if (ret < 0 || ret >= newdirlen + 1)
 		return false;
@@ -2691,9 +2993,10 @@ bool clone_update_unexp_hooks(struct lxc_conf *conf, const char *oldpath,
 		if (olddirlen >= newdirlen) {
 			size_t diff = olddirlen - newdirlen;
 			memcpy(p, newdir, newdirlen);
+
 			if (olddirlen != newdirlen) {
 				memmove(p + newdirlen, p + newdirlen + diff,
-					strlen(p) - newdirlen - diff + 1);
+				        strlen(p) - newdirlen - diff + 1);
 				lend -= diff;
 				conf->unexpanded_len -= diff;
 			}
@@ -2712,15 +3015,18 @@ bool clone_update_unexp_hooks(struct lxc_conf *conf, const char *oldpath,
 			conf->unexpanded_alloced = newlen + 1;
 			new[newlen - 1] = '\0';
 			lend = new + (lend - conf->unexpanded_config);
+
 			/* Move over the remainder to make room for the newdir.
 			 */
 			memmove(new + poffset + newdirlen,
-				new + poffset + olddirlen,
-				oldlen - poffset - olddirlen + 1);
+			        new + poffset + olddirlen,
+			        oldlen - poffset - olddirlen + 1);
 			conf->unexpanded_config = new;
+
 			memcpy(new + poffset, newdir, newdirlen);
 			lend += diff;
 		}
+
 	next:
 		lstart = lend;
 	}
@@ -2762,7 +3068,7 @@ bool network_new_hwaddrs(struct lxc_conf *conf)
 		else
 			lend++;
 
-		if (!lxc_config_net_hwaddr(lstart)) {
+		if (!lxc_config_net_is_hwaddr(lstart)) {
 			lstart = lend;
 			continue;
 		}
@@ -2843,6 +3149,7 @@ static int set_config_log_syslog(const char *key, const char *value,
 		return -1;
 
 	lxc_log_syslog(facility);
+
 	return set_config_string_item(&lxc_conf->syslog, value);
 }
 
@@ -2899,19 +3206,19 @@ static int get_config_personality(const char *key, char *retv, int inlen,
 static int get_config_pty_max(const char *key, char *retv, int inlen,
 			      struct lxc_conf *c, void *data)
 {
-	return lxc_get_conf_int(c, retv, inlen, c->pts);
+	return lxc_get_conf_size_t(c, retv, inlen, c->pty_max);
 }
 
 static int get_config_tty_max(const char *key, char *retv, int inlen,
 			      struct lxc_conf *c, void *data)
 {
-	return lxc_get_conf_int(c, retv, inlen, c->tty);
+	return lxc_get_conf_size_t(c, retv, inlen, c->ttys.max);
 }
 
 static int get_config_tty_dir(const char *key, char *retv, int inlen,
 			     struct lxc_conf *c, void *data)
 {
-	return lxc_get_conf_str(retv, inlen, c->ttydir);
+	return lxc_get_conf_str(retv, inlen, c->ttys.dir);
 }
 
 static int get_config_apparmor_profile(const char *key, char *retv, int inlen,
@@ -2928,6 +3235,34 @@ static int get_config_apparmor_allow_incomplete(const char *key, char *retv,
 				c->lsm_aa_allow_incomplete);
 }
 
+static int get_config_apparmor_allow_nesting(const char *key, char *retv,
+					     int inlen, struct lxc_conf *c,
+					     void *data)
+{
+	return lxc_get_conf_int(c, retv, inlen,
+				c->lsm_aa_allow_nesting);
+}
+
+static int get_config_apparmor_raw(const char *key, char *retv,
+				   int inlen, struct lxc_conf *c,
+				   void *data)
+{
+	int len;
+	struct lxc_list *it;
+	int fulllen = 0;
+
+	if (!retv)
+		inlen = 0;
+	else
+		memset(retv, 0, inlen);
+
+	lxc_list_for_each(it, &c->lsm_aa_raw) {
+		strprint(retv, inlen, "%s\n", (char *)it->elem);
+	}
+
+	return fulllen;
+}
+
 static int get_config_selinux_context(const char *key, char *retv, int inlen,
 				      struct lxc_conf *c, void *data)
 {
@@ -2937,7 +3272,7 @@ static int get_config_selinux_context(const char *key, char *retv, int inlen,
 /* If you ask for a specific cgroup value, i.e. lxc.cgroup.devices.list, then
  * just the value(s) will be printed. Since there still could be more than one,
  * it is newline-separated.
- * (Maybe that's ambigous, since some values, i.e. devices.list, will already
+ * (Maybe that's ambiguous, since some values, i.e. devices.list, will already
  * have newlines?)
  * If you ask for 'lxc.cgroup", then all cgroup entries will be printed, in
  * 'lxc.cgroup.subsystem.key = value' format.
@@ -2961,11 +3296,11 @@ static int __get_config_cgroup_controller(const char *key, char *retv,
 	if (version == CGROUP2_SUPER_MAGIC) {
 		global_token = "lxc.cgroup2";
 		namespaced_token = "lxc.cgroup2.";
-		namespaced_token_len = sizeof("lxc.cgroup2.") - 1;;
+		namespaced_token_len = STRLITERALLEN("lxc.cgroup2.");
 	} else if (version == CGROUP_SUPER_MAGIC) {
 		global_token = "lxc.cgroup";
 		namespaced_token = "lxc.cgroup.";
-		namespaced_token_len = sizeof("lxc.cgroup.") - 1;;
+		namespaced_token_len = STRLITERALLEN("lxc.cgroup.");
 	} else {
 		return -1;
 	}
@@ -2984,9 +3319,9 @@ static int __get_config_cgroup_controller(const char *key, char *retv,
 			if (version != cg->version)
 				continue;
 
-			strprint(retv, inlen, "%s.%s = %s\n",
-				 global_token, cg->subsystem, cg->value);
-		} else if (!strcmp(cg->subsystem, key)) {
+			strprint(retv, inlen, "%s.%s = %s\n", global_token,
+				 cg->subsystem, cg->value);
+		} else if (strcmp(cg->subsystem, key) == 0) {
 			strprint(retv, inlen, "%s\n", cg->value);
 		}
 	}
@@ -3024,6 +3359,14 @@ static int get_config_cgroup_dir(const char *key, char *retv, int inlen,
 	return fulllen;
 }
 
+static inline int get_config_cgroup_relative(const char *key, char *retv,
+					     int inlen, struct lxc_conf *lxc_conf,
+					     void *data)
+{
+	return lxc_get_conf_int(lxc_conf, retv, inlen,
+				lxc_conf->cgroup_meta.relative);
+}
+
 static int get_config_idmaps(const char *key, char *retv, int inlen,
 			     struct lxc_conf *c, void *data)
 {
@@ -3038,19 +3381,19 @@ static int get_config_idmaps(const char *key, char *retv, int inlen,
  * +
  * sizeof(" ")
  * +
- * sizeof(uint64_t)
+ * sizeof(uint32_t)
  * +
  * sizeof(" ")
  * +
- * sizeof(uint64_t)
+ * sizeof(uint32_t)
  * +
  * sizeof(" ")
  * +
- * sizeof(uint64_t)
+ * sizeof(uint32_t)
  * +
  * \0
  */
-#define __LXC_IDMAP_STR_BUF (3 * LXC_NUMSTRLEN64 + 3 + 1 + 1)
+#define __LXC_IDMAP_STR_BUF (3 * INTTYPE_TO_STRLEN(uint32_t) + 3 + 1 + 1)
 	char buf[__LXC_IDMAP_STR_BUF];
 
 	if (!retv)
@@ -3059,8 +3402,7 @@ static int get_config_idmaps(const char *key, char *retv, int inlen,
 		memset(retv, 0, inlen);
 
 	listlen = lxc_list_len(&c->id_map);
-	lxc_list_for_each(it, &c->id_map)
-	{
+	lxc_list_for_each(it, &c->id_map) {
 		struct id_map *map = it->elem;
 		ret = snprintf(buf, __LXC_IDMAP_STR_BUF, "%c %lu %lu %lu",
 			       (map->idtype == ID_TYPE_UID) ? 'u' : 'g',
@@ -3070,6 +3412,7 @@ static int get_config_idmaps(const char *key, char *retv, int inlen,
 
 		strprint(retv, inlen, "%s%s", buf, (listlen-- > 1) ? "\n" : "");
 	}
+
 	return fulllen;
 }
 
@@ -3193,6 +3536,12 @@ static int get_config_rootfs_path(const char *key, char *retv, int inlen,
 	return lxc_get_conf_str(retv, inlen, c->rootfs.path);
 }
 
+static int get_config_rootfs_managed(const char *key, char *retv, int inlen,
+				     struct lxc_conf *c, void *data)
+{
+	return lxc_get_conf_bool(c, retv, inlen, c->rootfs.managed);
+}
+
 static int get_config_rootfs_mount(const char *key, char *retv, int inlen,
 				   struct lxc_conf *c, void *data)
 {
@@ -3222,19 +3571,23 @@ static int get_config_hooks(const char *key, char *retv, int inlen,
 	int i;
 
 	subkey = strchr(key, '.');
-	if (subkey)
-		subkey = strchr(subkey + 1, '.');
+	if (!subkey)
+		return -1;
+
+	subkey = strchr(subkey + 1, '.');
 	if (!subkey)
 		return -1;
 	subkey++;
-	if (!*subkey)
+	if (*subkey == '\0')
 		return -1;
+
 	for (i = 0; i < NUM_LXC_HOOKS; i++) {
 		if (strcmp(lxchook_names[i], subkey) == 0) {
 			found = i;
 			break;
 		}
 	}
+
 	if (found == -1)
 		return -1;
 
@@ -3246,6 +3599,7 @@ static int get_config_hooks(const char *key, char *retv, int inlen,
 	lxc_list_for_each(it, &c->hooks[found]) {
 		strprint(retv, inlen, "%s\n", (char *)it->elem);
 	}
+
 	return fulllen;
 }
 
@@ -3343,6 +3697,12 @@ static int get_config_console_size(const char *key, char *retv, int inlen,
 	return lxc_get_conf_uint64(c, retv, inlen, c->console.log_size);
 }
 
+static int get_config_seccomp_allow_nesting(const char *key, char *retv,
+					    int inlen, struct lxc_conf *c,
+					    void *data)
+{
+	return lxc_get_conf_int(c, retv, inlen, c->seccomp_allow_nesting);
+}
 
 static int get_config_seccomp_profile(const char *key, char *retv, int inlen,
 				      struct lxc_conf *c, void *data)
@@ -3397,6 +3757,13 @@ static int get_config_monitor(const char *key, char *retv, int inlen,
 			      struct lxc_conf *c, void *data)
 {
 	return lxc_get_conf_int(c, retv, inlen, c->monitor_unshare);
+}
+
+static int get_config_monitor_signal_pdeath(const char *key, char *retv,
+					    int inlen, struct lxc_conf *c,
+					    void *data)
+{
+	return lxc_get_conf_int(c, retv, inlen, c->monitor_signal_pdeath);
 }
 
 static int get_config_group(const char *key, char *retv, int inlen,
@@ -3482,7 +3849,7 @@ static int get_config_no_new_privs(const char *key, char *retv, int inlen,
  * printed, in 'lxc.prlimit.resource = value' format.
  */
 static int get_config_prlimit(const char *key, char *retv, int inlen,
-			    struct lxc_conf *c, void *data)
+			      struct lxc_conf *c, void *data)
 {
 	int fulllen = 0, len;
 	bool get_all = false;
@@ -3501,23 +3868,23 @@ static int get_config_prlimit(const char *key, char *retv, int inlen,
 		return -1;
 
 	lxc_list_for_each(it, &c->limits) {
-		char buf[LXC_NUMSTRLEN64 * 2 + 2]; /* 2 colon separated 64 bit
-						      integers or the word
-						      'unlimited' */
+		/* 2 colon separated 64 bit integers or the word 'unlimited' */
+		char buf[INTTYPE_TO_STRLEN(uint64_t) * 2 + 2];
 		int partlen;
 		struct lxc_limit *lim = it->elem;
 
 		if (lim->limit.rlim_cur == RLIM_INFINITY) {
-			memcpy(buf, "unlimited", sizeof("unlimited"));
-			partlen = sizeof("unlimited") - 1;
+			memcpy(buf, "unlimited", STRLITERALLEN("unlimited") + 1);
+			partlen = STRLITERALLEN("unlimited");
 		} else {
 			partlen = sprintf(buf, "%" PRIu64,
 					  (uint64_t)lim->limit.rlim_cur);
 		}
+
 		if (lim->limit.rlim_cur != lim->limit.rlim_max) {
 			if (lim->limit.rlim_max == RLIM_INFINITY)
 				memcpy(buf + partlen, ":unlimited",
-				       sizeof(":unlimited"));
+				       STRLITERALLEN(":unlimited") + 1);
 			else
 				sprintf(buf + partlen, ":%" PRIu64,
 					(uint64_t)lim->limit.rlim_max);
@@ -3526,7 +3893,7 @@ static int get_config_prlimit(const char *key, char *retv, int inlen,
 		if (get_all) {
 			strprint(retv, inlen, "lxc.prlimit.%s = %s\n",
 				 lim->resource, buf);
-		} else if (!strcmp(lim->resource, key)) {
+		} else if (strcmp(lim->resource, key) == 0) {
 			strprint(retv, inlen, "%s", buf);
 		}
 	}
@@ -3539,7 +3906,7 @@ static int get_config_prlimit(const char *key, char *retv, int inlen,
  * entries will be printed, in 'lxc.sysctl.key = value' format.
  */
 static int get_config_sysctl(const char *key, char *retv, int inlen,
-			    struct lxc_conf *c, void *data)
+			     struct lxc_conf *c, void *data)
 {
 	int len;
 	struct lxc_list *it;
@@ -3553,16 +3920,16 @@ static int get_config_sysctl(const char *key, char *retv, int inlen,
 
 	if (strcmp(key, "lxc.sysctl") == 0)
 		get_all = true;
-	else if (strncmp(key, "lxc.sysctl.", sizeof("lxc.sysctl.") - 1) == 0)
-		key += sizeof("lxc.sysctl.") - 1;
+	else if (strncmp(key, "lxc.sysctl.", STRLITERALLEN("lxc.sysctl.")) == 0)
+		key += STRLITERALLEN("lxc.sysctl.");
 	else
 		return -1;
 
 	lxc_list_for_each(it, &c->sysctls) {
 		struct lxc_sysctl *elem = it->elem;
 		if (get_all) {
-			strprint(retv, inlen, "lxc.sysctl.%s = %s\n",
-				 elem->key, elem->value);
+			strprint(retv, inlen, "lxc.sysctl.%s = %s\n", elem->key,
+				 elem->value);
 		} else if (strcmp(elem->key, key) == 0) {
 			strprint(retv, inlen, "%s", elem->value);
 		}
@@ -3572,7 +3939,7 @@ static int get_config_sysctl(const char *key, char *retv, int inlen,
 }
 
 static int get_config_proc(const char *key, char *retv, int inlen,
-			    struct lxc_conf *c, void *data)
+			   struct lxc_conf *c, void *data)
 {
 	struct lxc_list *it;
 	int len;
@@ -3586,8 +3953,8 @@ static int get_config_proc(const char *key, char *retv, int inlen,
 
 	if (strcmp(key, "lxc.proc") == 0)
 		get_all = true;
-	else if (strncmp(key, "lxc.proc.", sizeof("lxc.proc.") - 1) == 0)
-		key += sizeof("lxc.proc.") - 1;
+	else if (strncmp(key, "lxc.proc.", STRLITERALLEN("lxc.proc.")) == 0)
+		key += STRLITERALLEN("lxc.proc.");
 	else
 		return -1;
 
@@ -3596,7 +3963,7 @@ static int get_config_proc(const char *key, char *retv, int inlen,
 
 		if (get_all) {
 			strprint(retv, inlen, "lxc.proc.%s = %s\n",
-				 proc->filename, proc->value);
+			         proc->filename, proc->value);
 		} else if (strcmp(proc->filename, key) == 0) {
 			strprint(retv, inlen, "%s", proc->value);
 		}
@@ -3655,7 +4022,7 @@ static int get_config_namespace_share(const char *key, char *retv, int inlen,
 	else
 		memset(retv, 0, inlen);
 
-	namespace = key + sizeof("lxc.namespace.share.") - 1;
+	namespace = key + STRLITERALLEN("lxc.namespace.share.");
 	ns_idx = lxc_namespace_2_ns_idx(namespace);
 	if (ns_idx < 0)
 		return ns_idx;
@@ -3676,22 +4043,22 @@ static inline int clr_config_personality(const char *key, struct lxc_conf *c,
 static inline int clr_config_pty_max(const char *key, struct lxc_conf *c,
 				     void *data)
 {
-	c->pts = 0;
+	c->pty_max = 0;
 	return 0;
 }
 
 static inline int clr_config_tty_max(const char *key, struct lxc_conf *c,
 				     void *data)
 {
-	c->tty = 0;
+	c->ttys.tty = 0;
 	return 0;
 }
 
 static inline int clr_config_tty_dir(const char *key, struct lxc_conf *c,
 				    void *data)
 {
-	free(c->ttydir);
-	c->ttydir = NULL;
+	free(c->ttys.dir);
+	c->ttys.dir = NULL;
 	return 0;
 }
 
@@ -3709,6 +4076,21 @@ static inline int clr_config_apparmor_allow_incomplete(const char *key,
 {
 	c->lsm_aa_allow_incomplete = 0;
 	return 0;
+}
+
+static inline int clr_config_apparmor_allow_nesting(const char *key,
+						    struct lxc_conf *c,
+						    void *data)
+{
+	c->lsm_aa_allow_nesting = 0;
+	return 0;
+}
+
+static inline int clr_config_apparmor_raw(const char *key,
+					  struct lxc_conf *c,
+					  void *data)
+{
+	return lxc_clear_apparmor_raw(c);
 }
 
 static inline int clr_config_selinux_context(const char *key,
@@ -3739,6 +4121,14 @@ static int clr_config_cgroup_dir(const char *key, struct lxc_conf *lxc_conf,
 		lxc_conf->cgroup_meta.dir = NULL;
 	}
 
+	return 0;
+}
+
+static inline int clr_config_cgroup_relative(const char *key,
+					     struct lxc_conf *lxc_conf,
+					     void *data)
+{
+	lxc_conf->cgroup_meta.relative = false;
 	return 0;
 }
 
@@ -3791,6 +4181,13 @@ static inline int clr_config_rootfs_path(const char *key, struct lxc_conf *c,
 	return 0;
 }
 
+static inline int clr_config_rootfs_managed(const char *key, struct lxc_conf *c,
+					    void *data)
+{
+	c->rootfs.managed = true;
+	return 0;
+}
+
 static inline int clr_config_rootfs_mount(const char *key, struct lxc_conf *c,
 					  void *data)
 {
@@ -3804,6 +4201,10 @@ static inline int clr_config_rootfs_options(const char *key, struct lxc_conf *c,
 {
 	free(c->rootfs.options);
 	c->rootfs.options = NULL;
+
+	free(c->rootfs.data);
+	c->rootfs.data = NULL;
+
 	return 0;
 }
 
@@ -3886,6 +4287,13 @@ static inline int clr_config_console_size(const char *key, struct lxc_conf *c,
 	return 0;
 }
 
+static inline int clr_config_seccomp_allow_nesting(const char *key,
+						   struct lxc_conf *c, void *data)
+{
+	c->seccomp_allow_nesting = 0;
+	return 0;
+}
+
 static inline int clr_config_seccomp_profile(const char *key,
 					     struct lxc_conf *c, void *data)
 {
@@ -3947,6 +4355,13 @@ static inline int clr_config_monitor(const char *key, struct lxc_conf *c,
 				     void *data)
 {
 	c->monitor_unshare = 0;
+	return 0;
+}
+
+static inline int clr_config_monitor_signal_pdeath(const char *key,
+						   struct lxc_conf *c, void *data)
+{
+	c->monitor_signal_pdeath = 0;
 	return 0;
 }
 
@@ -4059,7 +4474,7 @@ static int clr_config_namespace_share(const char *key,
 	int ns_idx;
 	const char *namespace;
 
-	namespace = key + sizeof("lxc.namespace.share.") - 1;
+	namespace = key + STRLITERALLEN("lxc.namespace.share.");
 	ns_idx = lxc_namespace_2_ns_idx(namespace);
 	if (ns_idx < 0)
 		return ns_idx;
@@ -4117,8 +4532,9 @@ static struct lxc_config_t *get_network_config_ops(const char *key,
 	/* parse current index */
 	ret = lxc_safe_uint((idx_start + 1), &tmpidx);
 	if (ret < 0) {
-		ERROR("Failed to parse usigned integer from string \"%s\": %s",
-		      idx_start + 1, strerror(-ret));
+		errno = -ret;
+		SYSERROR("Failed to parse unsigned integer from string \"%s\"",
+		         idx_start + 1);
 		*idx = ret;
 		goto on_error;
 	}
@@ -4129,7 +4545,7 @@ static struct lxc_config_t *get_network_config_ops(const char *key,
 	 */
 	if (tmpidx == INT_MAX) {
 		SYSERROR("Number of configured networks would overflow the "
-			 "counter");
+		         "counter");
 		goto on_error;
 	}
 	*idx = tmpidx;
@@ -4200,6 +4616,7 @@ static int set_config_net_nic(const char *key, const char *value,
 
 	ret = config->set(deindexed_key, value, lxc_conf, netdev);
 	free(deindexed_key);
+
 	return ret;
 }
 
@@ -4245,6 +4662,7 @@ static int clr_config_net_nic(const char *key, struct lxc_conf *lxc_conf,
 
 	ret = config->clr(deindexed_key, lxc_conf, netdev);
 	free(deindexed_key);
+
 	return ret;
 }
 
@@ -4488,6 +4906,7 @@ static int get_config_net_nic(const char *key, char *retv, int inlen,
 
 	ret = config->get(deindexed_key, retv, inlen, c, netdev);
 	free(deindexed_key);
+
 	return ret;
 }
 
@@ -4794,6 +5213,7 @@ static int get_config_net_ipv4_address(const char *key, char *retv, int inlen,
 		return -1;
 
 	listlen = lxc_list_len(&netdev->ipv4);
+
 	lxc_list_for_each(it, &netdev->ipv4) {
 		struct lxc_inetdev *i = it->elem;
 		inet_ntop(AF_INET, &i->addr, buf, sizeof(buf));
@@ -4849,6 +5269,7 @@ static int get_config_net_ipv6_address(const char *key, char *retv, int inlen,
 		return -1;
 
 	listlen = lxc_list_len(&netdev->ipv6);
+
 	lxc_list_for_each(it, &netdev->ipv6) {
 		struct lxc_inet6dev *i = it->elem;
 		inet_ntop(AF_INET6, &i->addr, buf, sizeof(buf));
@@ -4870,8 +5291,8 @@ int lxc_list_config_items(char *retv, int inlen)
 	else
 		memset(retv, 0, inlen);
 
-	for (i = 0; i < config_size; i++) {
-		char *s = config[i].name;
+	for (i = 0; i < config_jump_table_size; i++) {
+		char *s = config_jump_table[i].name;
 
 		if (s[strlen(s) - 1] == '.')
 			continue;
@@ -4895,7 +5316,9 @@ int lxc_list_subkeys(struct lxc_conf *conf, const char *key, char *retv,
 
 	if (!strcmp(key, "lxc.apparmor")) {
 		strprint(retv, inlen, "allow_incomplete\n");
+		strprint(retv, inlen, "allow_nesting\n");
 		strprint(retv, inlen, "profile\n");
+		strprint(retv, inlen, "raw\n");
 	} else if (!strcmp(key, "lxc.cgroup")) {
 		strprint(retv, inlen, "dir\n");
 	} else if (!strcmp(key, "lxc.selinux")) {
@@ -4974,6 +5397,7 @@ int lxc_list_net(struct lxc_conf *c, const char *key, char *retv, int inlen)
 	strprint(retv, inlen, "type\n");
 	strprint(retv, inlen, "script.up\n");
 	strprint(retv, inlen, "script.down\n");
+
 	if (netdev->type != LXC_NET_EMPTY) {
 		strprint(retv, inlen, "flags\n");
 		strprint(retv, inlen, "link\n");

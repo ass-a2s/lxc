@@ -21,9 +21,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
-#include "config.h"
-
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
@@ -43,6 +43,7 @@
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/prctl.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -52,6 +53,32 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "af_unix.h"
+#include "caps.h"
+#include "cgroup.h"
+#include "conf.h"
+#include "config.h"
+#include "confile.h"
+#include "confile_utils.h"
+#include "error.h"
+#include "log.h"
+#include "lsm/lsm.h"
+#include "lxclock.h"
+#include "lxcseccomp.h"
+#include "macro.h"
+#include "memory_utils.h"
+#include "namespace.h"
+#include "network.h"
+#include "parse.h"
+#include "raw_syscalls.h"
+#include "ringbuf.h"
+#include "start.h"
+#include "storage.h"
+#include "storage/overlay.h"
+#include "syscall_wrappers.h"
+#include "terminal.h"
+#include "utils.h"
 
 #ifdef MAJOR_IN_MKDEV
 #include <sys/mkdev.h>
@@ -75,6 +102,10 @@
 #include <sys/personality.h>
 #endif
 
+#ifndef HAVE_STRLCAT
+#include "include/strlcat.h"
+#endif
+
 #if IS_BIONIC
 #include <../include/lxcmntent.h>
 #else
@@ -85,57 +116,15 @@
 #include <../include/prlimit.h>
 #endif
 
-#include "af_unix.h"
-#include "caps.h"
-#include "cgroup.h"
-#include "conf.h"
-#include "confile_utils.h"
-#include "error.h"
-#include "log.h"
-#include "lsm/lsm.h"
-#include "lxclock.h"
-#include "lxcseccomp.h"
-#include "namespace.h"
-#include "network.h"
-#include "parse.h"
-#include "ringbuf.h"
-#include "storage.h"
-#include "storage/overlay.h"
-#include "terminal.h"
-#include "utils.h"
-
-#ifndef MS_PRIVATE
-#define MS_PRIVATE (1<<18)
-#endif
-
-#ifndef MS_LAZYTIME
-#define MS_LAZYTIME (1<<25)
-#endif
-
-lxc_log_define(lxc_conf, lxc);
+lxc_log_define(conf, lxc);
 
 /* The lxc_conf of the container currently being worked on in an API call.
  * This is used in the error calls.
  */
 #ifdef HAVE_TLS
-__thread struct lxc_conf *current_config;
+thread_local struct lxc_conf *current_config;
 #else
 struct lxc_conf *current_config;
-#endif
-
-/* Define pivot_root() if missing from the C library */
-#ifndef HAVE_PIVOT_ROOT
-static int pivot_root(const char *new_root, const char *put_old)
-{
-#ifdef __NR_pivot_root
-	return syscall(__NR_pivot_root, new_root, put_old);
-#else
-	errno = ENOSYS;
-	return -1;
-#endif
-}
-#else
-extern int pivot_root(const char *new_root, const char *put_old);
 #endif
 
 char *lxchook_names[NUM_LXC_HOOKS] = {
@@ -317,8 +306,8 @@ static struct limit_opt limit_opt[] = {
 
 static int run_buffer(char *buffer)
 {
-	int ret;
-	char *output;
+	__do_free char *output = NULL;
+	int fd, ret;
 	struct lxc_popen_FILE *f;
 
 	f = lxc_popen(buffer);
@@ -334,10 +323,25 @@ static int run_buffer(char *buffer)
 		return -1;
 	}
 
-	while (fgets(output, LXC_LOG_BUFFER_SIZE, f->f))
-		DEBUG("Script %s with output: %s", buffer, output);
+	fd = fileno(f->f);
+	if (fd < 0) {
+		SYSERROR("Failed to retrieve underlying file descriptor");
+		lxc_pclose(f);
+		return -1;
+	}
 
-	free(output);
+	for (int i = 0; i < 10; i++) {
+		ssize_t bytes_read;
+
+		bytes_read = lxc_read_nointr(fd, output, LXC_LOG_BUFFER_SIZE - 1);
+		if (bytes_read > 0) {
+			output[bytes_read] = '\0';
+			DEBUG("Script %s produced output: %s", buffer, output);
+			continue;
+		}
+
+		break;
+	}
 
 	ret = lxc_pclose(f);
 	if (ret == -1) {
@@ -358,9 +362,8 @@ int run_script_argv(const char *name, unsigned int hook_version,
 		    const char *section, const char *script,
 		    const char *hookname, char **argv)
 {
+	__do_free char *buffer = NULL;
 	int buf_pos, i, ret;
-	char *buffer;
-	int fret = -1;
 	size_t size = 0;
 
 	if (hook_version == 0)
@@ -372,7 +375,8 @@ int run_script_argv(const char *name, unsigned int hook_version,
 	for (i = 0; argv && argv[i]; i++)
 		size += strlen(argv[i]) + 1;
 
-	size += sizeof("exec");
+	size += STRLITERALLEN("exec");
+	size++;
 	size += strlen(script);
 	size++;
 
@@ -403,7 +407,7 @@ int run_script_argv(const char *name, unsigned int hook_version,
 		buf_pos = snprintf(buffer, size, "exec %s", script);
 	if (buf_pos < 0 || (size_t)buf_pos >= size) {
 		ERROR("Failed to create command line for script \"%s\"", script);
-		goto on_error;
+		return -1;
 	}
 
 	if (hook_version == 1) {
@@ -411,7 +415,7 @@ int run_script_argv(const char *name, unsigned int hook_version,
 		if (ret < 0) {
 			SYSERROR("Failed to set environment variable: "
 				 "LXC_HOOK_TYPE=%s", hookname);
-			goto on_error;
+			return -1;
 		}
 		TRACE("Set environment variable: LXC_HOOK_TYPE=%s", hookname);
 
@@ -419,7 +423,7 @@ int run_script_argv(const char *name, unsigned int hook_version,
 		if (ret < 0) {
 			SYSERROR("Failed to set environment variable: "
 				 "LXC_HOOK_SECTION=%s", section);
-			goto on_error;
+			return -1;
 		}
 		TRACE("Set environment variable: LXC_HOOK_SECTION=%s", section);
 
@@ -427,42 +431,42 @@ int run_script_argv(const char *name, unsigned int hook_version,
 			char *parent;
 
 			if (!argv || !argv[0])
-				goto on_error;
+				return -1;
 
 			ret = setenv("LXC_NET_TYPE", argv[0], 1);
 			if (ret < 0) {
 				SYSERROR("Failed to set environment variable: "
 					 "LXC_NET_TYPE=%s", argv[0]);
-				goto on_error;
+				return -1;
 			}
 			TRACE("Set environment variable: LXC_NET_TYPE=%s", argv[0]);
 
 			parent = argv[1] ? argv[1] : "";
 
-			if (strcmp(argv[0], "macvlan")) {
+			if (strcmp(argv[0], "macvlan") == 0) {
 				ret = setenv("LXC_NET_PARENT", parent, 1);
 				if (ret < 0) {
 					SYSERROR("Failed to set environment "
 						 "variable: LXC_NET_PARENT=%s", parent);
-					goto on_error;
+					return -1;
 				}
 				TRACE("Set environment variable: LXC_NET_PARENT=%s", parent);
-			} else if (strcmp(argv[0], "phys")) {
+			} else if (strcmp(argv[0], "phys") == 0) {
 				ret = setenv("LXC_NET_PARENT", parent, 1);
 				if (ret < 0) {
 					SYSERROR("Failed to set environment "
 						 "variable: LXC_NET_PARENT=%s", parent);
-					goto on_error;
+					return -1;
 				}
 				TRACE("Set environment variable: LXC_NET_PARENT=%s", parent);
-			} else if (strcmp(argv[0], "veth")) {
+			} else if (strcmp(argv[0], "veth") == 0) {
 				char *peer = argv[2] ? argv[2] : "";
 
 				ret = setenv("LXC_NET_PEER", peer, 1);
 				if (ret < 0) {
 					SYSERROR("Failed to set environment "
 						 "variable: LXC_NET_PEER=%s", peer);
-					goto on_error;
+					return -1;
 				}
 				TRACE("Set environment variable: LXC_NET_PEER=%s", peer);
 
@@ -470,7 +474,7 @@ int run_script_argv(const char *name, unsigned int hook_version,
 				if (ret < 0) {
 					SYSERROR("Failed to set environment "
 						 "variable: LXC_NET_PARENT=%s", parent);
-					goto on_error;
+					return -1;
 				}
 				TRACE("Set environment variable: LXC_NET_PARENT=%s", parent);
 			}
@@ -483,22 +487,19 @@ int run_script_argv(const char *name, unsigned int hook_version,
 		ret = snprintf(buffer + buf_pos, len, " %s", argv[i]);
 		if (ret < 0 || (size_t)ret >= len) {
 			ERROR("Failed to create command line for script \"%s\"", script);
-			goto on_error;
+			return -1;
 		}
 		buf_pos += ret;
 	}
 
-	fret = run_buffer(buffer);
-
-on_error:
-	free(buffer);
-	return fret;
+	return run_buffer(buffer);
 }
 
 int run_script(const char *name, const char *section, const char *script, ...)
 {
+	__do_free char *buffer = NULL;
 	int ret;
-	char *buffer, *p;
+	char *p;
 	va_list ap;
 	size_t size = 0;
 
@@ -510,7 +511,7 @@ int run_script(const char *name, const char *section, const char *script, ...)
 		size += strlen(p) + 1;
 	va_end(ap);
 
-	size += strlen("exec");
+	size += STRLITERALLEN("exec");
 	size += strlen(script);
 	size += strlen(name);
 	size += strlen(section);
@@ -519,7 +520,7 @@ int run_script(const char *name, const char *section, const char *script, ...)
 	if (size > INT_MAX)
 		return -1;
 
-	buffer = alloca(size);
+	buffer = must_realloc(NULL, size);
 	ret = snprintf(buffer, size, "exec %s %s %s", script, name, section);
 	if (ret < 0 || ret >= size)
 		return -1;
@@ -529,8 +530,10 @@ int run_script(const char *name, const char *section, const char *script, ...)
 		int len = size - ret;
 		int rc;
 		rc = snprintf(buffer + ret, len, " %s", p);
-		if (rc < 0 || rc >= len)
+		if (rc < 0 || rc >= len) {
+			va_end(ap);
 			return -1;
+		}
 		ret += rc;
 	}
 	va_end(ap);
@@ -539,29 +542,29 @@ int run_script(const char *name, const char *section, const char *script, ...)
 }
 
 /* pin_rootfs
- * if rootfs is a directory, then open ${rootfs}/lxc.hold for writing for
+ * if rootfs is a directory, then open ${rootfs}/.lxc-keep for writing for
  * the duration of the container run, to prevent the container from marking
  * the underlying fs readonly on shutdown. unlink the file immediately so
- * no name pollution is happens
+ * no name pollution is happens.
+ * don't unlink on NFS to avoid random named stale handles.
  * return -1 on error.
  * return -2 if nothing needed to be pinned.
  * return an open fd (>=0) if we pinned it.
  */
 int pin_rootfs(const char *rootfs)
 {
+	__do_free char *absrootfs = NULL;
 	int fd, ret;
-	char absrootfs[MAXPATHLEN], absrootfspin[MAXPATHLEN];
+	char absrootfspin[PATH_MAX];
 	struct stat s;
+	struct statfs sfs;
 
 	if (rootfs == NULL || strlen(rootfs) == 0)
 		return -2;
 
-	if (!realpath(rootfs, absrootfs))
+	absrootfs = realpath(rootfs, NULL);
+	if (!absrootfs)
 		return -2;
-
-	ret = access(absrootfs, F_OK);
-	if (ret != 0)
-		return -1;
 
 	ret = stat(absrootfs, &s);
 	if (ret < 0)
@@ -570,13 +573,22 @@ int pin_rootfs(const char *rootfs)
 	if (!S_ISDIR(s.st_mode))
 		return -2;
 
-	ret = snprintf(absrootfspin, MAXPATHLEN, "%s/lxc.hold", absrootfs);
-	if (ret >= MAXPATHLEN)
+	ret = snprintf(absrootfspin, PATH_MAX, "%s/.lxc-keep", absrootfs);
+	if (ret < 0 || ret >= PATH_MAX)
 		return -1;
 
 	fd = open(absrootfspin, O_CREAT | O_RDWR, S_IWUSR | S_IRUSR);
 	if (fd < 0)
 		return fd;
+
+	ret = fstatfs (fd, &sfs);
+	if (ret < 0)
+		return fd;
+
+	if (sfs.f_type == NFS_SUPER_MAGIC) {
+		DEBUG("Rootfs on NFS, not unlinking pin file \"%s\"", absrootfspin);
+		return fd;
+	}
 
 	(void)unlink(absrootfspin);
 
@@ -594,9 +606,6 @@ unsigned long add_required_remount_flags(const char *s, const char *d,
 	struct statvfs sb;
 	unsigned long required_flags = 0;
 
-	if (!(flags & MS_REMOUNT))
-		return flags;
-
 	if (!s)
 		s = d;
 
@@ -607,19 +616,49 @@ unsigned long add_required_remount_flags(const char *s, const char *d,
 	if (ret < 0)
 		return flags;
 
-	if (sb.f_flag & MS_NOSUID)
-		required_flags |= MS_NOSUID;
-	if (sb.f_flag & MS_NODEV)
-		required_flags |= MS_NODEV;
-	if (sb.f_flag & MS_RDONLY)
-		required_flags |= MS_RDONLY;
-	if (sb.f_flag & MS_NOEXEC)
-		required_flags |= MS_NOEXEC;
+	if (flags & MS_REMOUNT) {
+		if (sb.f_flag & MS_NOSUID)
+			required_flags |= MS_NOSUID;
+		if (sb.f_flag & MS_NODEV)
+			required_flags |= MS_NODEV;
+		if (sb.f_flag & MS_RDONLY)
+			required_flags |= MS_RDONLY;
+		if (sb.f_flag & MS_NOEXEC)
+			required_flags |= MS_NOEXEC;
+	}
+
+	if (sb.f_flag & MS_NOATIME)
+		required_flags |= MS_NOATIME;
+	if (sb.f_flag & MS_NODIRATIME)
+		required_flags |= MS_NODIRATIME;
+	if (sb.f_flag & MS_LAZYTIME)
+		required_flags |= MS_LAZYTIME;
+	if (sb.f_flag & MS_RELATIME)
+		required_flags |= MS_RELATIME;
+	if (sb.f_flag & MS_STRICTATIME)
+		required_flags |= MS_STRICTATIME;
 
 	return flags | required_flags;
 #else
 	return flags;
 #endif
+}
+
+static int add_shmount_to_list(struct lxc_conf *conf)
+{
+	char new_mount[PATH_MAX];
+	/* Offset for the leading '/' since the path_cont
+	 * is absolute inside the container.
+	 */
+	int offset = 1, ret = -1;
+
+	ret = snprintf(new_mount, sizeof(new_mount),
+		       "%s %s none bind,create=dir 0 0", conf->shmount.path_host,
+		       conf->shmount.path_cont + offset);
+	if (ret < 0 || (size_t)ret >= sizeof(new_mount))
+		return -1;
+
+	return add_elem_to_mount_list(new_mount, conf);
 }
 
 static int lxc_mount_auto_mounts(struct lxc_conf *conf, int flags, struct lxc_handler *handler)
@@ -667,10 +706,9 @@ static int lxc_mount_auto_mounts(struct lxc_conf *conf, int flags, struct lxc_ha
 	};
 
 	for (i = 0; default_mounts[i].match_mask; i++) {
+		__do_free char *destination = NULL, *source = NULL;
 		int saved_errno;
 		unsigned long mflags;
-		char *destination = NULL;
-		char *source = NULL;
 		if ((flags & default_mounts[i].match_mask) != default_mounts[i].match_flag)
 			continue;
 
@@ -683,16 +721,12 @@ static int lxc_mount_auto_mounts(struct lxc_conf *conf, int flags, struct lxc_ha
 
 		if (!default_mounts[i].destination) {
 			ERROR("BUG: auto mounts destination %d was NULL", i);
-			free(source);
 			return -1;
 		}
 
 		/* will act like strdup if %r is not present */
 		destination = lxc_string_replace("%r", conf->rootfs.path ? conf->rootfs.mount : "", default_mounts[i].destination);
 		if (!destination) {
-			saved_errno = errno;
-			free(source);
-			errno = saved_errno;
 			return -1;
 		}
 
@@ -710,8 +744,6 @@ static int lxc_mount_auto_mounts(struct lxc_conf *conf, int flags, struct lxc_ha
 			SYSERROR("Failed to mount \"%s\" on \"%s\" with flags %lu", source, destination, mflags);
 		}
 
-		free(source);
-		free(destination);
 		if (r < 0) {
 			errno = saved_errno;
 			return -1;
@@ -749,8 +781,19 @@ static int lxc_mount_auto_mounts(struct lxc_conf *conf, int flags, struct lxc_ha
 		if (flags & LXC_AUTO_CGROUP_FORCE)
 			cg_flags |= LXC_AUTO_CGROUP_FORCE;
 
-		if (!cgroup_mount(conf->rootfs.path ? conf->rootfs.mount : "", handler, cg_flags)) {
+		if (!handler->cgroup_ops->mount(handler->cgroup_ops,
+						handler,
+						conf->rootfs.path ? conf->rootfs.mount : "",
+						cg_flags)) {
 			SYSERROR("Failed to mount \"/sys/fs/cgroup\"");
+			return -1;
+		}
+	}
+
+	if (flags & LXC_AUTO_SHMOUNTS_MASK) {
+		int ret = add_shmount_to_list(conf);
+		if (ret < 0) {
+			ERROR("Failed to add shmount entry to container config");
 			return -1;
 		}
 	}
@@ -791,7 +834,7 @@ static const struct dev_symlinks dev_symlinks[] = {
 static int lxc_setup_dev_symlinks(const struct lxc_rootfs *rootfs)
 {
 	int i, ret;
-	char path[MAXPATHLEN];
+	char path[PATH_MAX];
 	struct stat s;
 
 	for (i = 0; i < sizeof(dev_symlinks) / sizeof(dev_symlinks[0]); i++) {
@@ -799,7 +842,7 @@ static int lxc_setup_dev_symlinks(const struct lxc_rootfs *rootfs)
 
 		ret = snprintf(path, sizeof(path), "%s/dev/%s",
 			       rootfs->path ? rootfs->mount : "", d->name);
-		if (ret < 0 || ret >= MAXPATHLEN)
+		if (ret < 0 || ret >= PATH_MAX)
 			return -1;
 
 		/* Stat the path first. If we don't get an error accept it as
@@ -824,9 +867,10 @@ static int lxc_setup_dev_symlinks(const struct lxc_rootfs *rootfs)
 }
 
 /* Build a space-separate list of ptys to pass to systemd. */
-static bool append_ptyname(char **pp, char *name)
+static bool append_ttyname(char **pp, char *name)
 {
 	char *p;
+	size_t size;
 
 	if (!*pp) {
 		*pp = malloc(strlen(name) + strlen("container_ttys=") + 1);
@@ -837,13 +881,14 @@ static bool append_ptyname(char **pp, char *name)
 		return true;
 	}
 
-	p = realloc(*pp, strlen(*pp) + strlen(name) + 2);
+	size = strlen(*pp) + strlen(name) + 2;
+	p = realloc(*pp, size);
 	if (!p)
 		return false;
 
 	*pp = p;
-	strcat(p, " ");
-	strcat(p, name);
+	(void)strlcat(p, " ", size);
+	(void)strlcat(p, name, size);
 
 	return true;
 }
@@ -852,13 +897,13 @@ static int lxc_setup_ttys(struct lxc_conf *conf)
 {
 	int i, ret;
 	const struct lxc_tty_info *ttys = &conf->ttys;
-	char *ttydir = conf->ttydir;
-	char path[MAXPATHLEN], lxcpath[MAXPATHLEN];
+	char *ttydir = ttys->dir;
+	char path[PATH_MAX], lxcpath[PATH_MAX];
 
 	if (!conf->rootfs.path)
 		return 0;
 
-	for (i = 0; i < ttys->nbtty; i++) {
+	for (i = 0; i < ttys->max; i++) {
 		struct lxc_terminal_info *tty = &ttys->tty[i];
 
 		ret = snprintf(path, sizeof(path), "/dev/tty%d", i + 1);
@@ -872,13 +917,11 @@ static int lxc_setup_ttys(struct lxc_conf *conf)
 			if (ret < 0 || (size_t)ret >= sizeof(lxcpath))
 				return -1;
 
-			ret = creat(lxcpath, 0660);
+			ret = mknod(lxcpath, S_IFREG | 0000, 0);
 			if (ret < 0 && errno != EEXIST) {
 				SYSERROR("Failed to create \"%s\"", lxcpath);
 				return -1;
 			}
-			if (ret >= 0)
-				close(ret);
 
 			ret = unlink(path);
 			if (ret < 0 && errno != ENOENT) {
@@ -888,12 +931,12 @@ static int lxc_setup_ttys(struct lxc_conf *conf)
 
 			ret = mount(tty->name, lxcpath, "none", MS_BIND, 0);
 			if (ret < 0) {
-				WARN("Failed to bind mount \"%s\" onto \"%s\"",
-				     tty->name, path);
+				SYSWARN("Failed to bind mount \"%s\" onto \"%s\"",
+				     tty->name, lxcpath);
 				continue;
 			}
 			DEBUG("Bind mounted \"%s\" onto \"%s\"", tty->name,
-			      path);
+			      lxcpath);
 
 			ret = snprintf(lxcpath, sizeof(lxcpath), "%s/tty%d",
 				       ttydir, i + 1);
@@ -910,16 +953,9 @@ static int lxc_setup_ttys(struct lxc_conf *conf)
 			/* If we populated /dev, then we need to create
 			 * /dev/ttyN
 			 */
-			ret = access(path, F_OK);
-			if (ret < 0) {
-				ret = creat(path, 0660);
-				if (ret < 0) {
-					SYSERROR("Failed to create \"%s\"", path);
-					/* this isn't fatal, continue */
-				} else {
-					close(ret);
-				}
-			}
+			ret = mknod(path, S_IFREG | 0000, 0);
+			if (ret < 0) /* this isn't fatal, continue */
+				SYSERROR("Failed to create \"%s\"", path);
 
 			ret = mount(tty->name, path, "none", MS_BIND, 0);
 			if (ret < 0) {
@@ -927,41 +963,50 @@ static int lxc_setup_ttys(struct lxc_conf *conf)
 				continue;
 			}
 
-			DEBUG("Bind mounted \"%s\" onto \"%s\"", tty->name,
-			      path);
+			DEBUG("Bind mounted \"%s\" onto \"%s\"", tty->name, path);
 		}
 
-		if (!append_ptyname(&conf->pty_names, tty->name)) {
+		if (!append_ttyname(&conf->ttys.tty_names, tty->name)) {
 			ERROR("Error setting up container_ttys string");
 			return -1;
 		}
 	}
 
-	INFO("Finished setting up %d /dev/tty<N> device(s)", ttys->nbtty);
+	INFO("Finished setting up %zu /dev/tty<N> device(s)", ttys->max);
 	return 0;
 }
 
-int lxc_allocate_ttys(const char *name, struct lxc_conf *conf)
+int lxc_allocate_ttys(struct lxc_conf *conf)
 {
-	int i, ret;
+	size_t i;
+	int ret;
 	struct lxc_tty_info *ttys = &conf->ttys;
 
 	/* no tty in the configuration */
-	if (!conf->tty)
+	if (ttys->max == 0)
 		return 0;
 
-	ttys->tty = malloc(sizeof(*ttys->tty) * conf->tty);
+	ttys->tty = malloc(sizeof(*ttys->tty) * ttys->max);
 	if (!ttys->tty)
 		return -ENOMEM;
 
-	for (i = 0; i < conf->tty; i++) {
+	for (i = 0; i < ttys->max; i++) {
 		struct lxc_terminal_info *tty = &ttys->tty[i];
 
-		ret = openpty(&tty->master, &tty->slave,
-			      tty->name, NULL, NULL);
-		if (ret) {
-			SYSERROR("Failed to create tty %d", i);
-			ttys->nbtty = i;
+		tty->master = -EBADF;
+		tty->slave = -EBADF;
+		ret = openpty(&tty->master, &tty->slave, NULL, NULL, NULL);
+		if (ret < 0) {
+			SYSERROR("Failed to create tty %zu", i);
+			ttys->max = i;
+			lxc_delete_tty(ttys);
+			return -ENOTTY;
+		}
+
+		ret = ttyname_r(tty->slave, tty->name, sizeof(tty->name));
+		if (ret < 0) {
+			SYSERROR("Failed to retrieve name of tty %zu slave", i);
+			ttys->max = i;
 			lxc_delete_tty(ttys);
 			return -ENOTTY;
 		}
@@ -970,24 +1015,20 @@ int lxc_allocate_ttys(const char *name, struct lxc_conf *conf)
 		      tty->name, tty->master, tty->slave);
 
 		/* Prevent leaking the file descriptors to the container */
-		ret = fcntl(tty->master, F_SETFD, FD_CLOEXEC);
+		ret = fd_cloexec(tty->master, true);
 		if (ret < 0)
-			WARN("Failed to set FD_CLOEXEC flag on master fd %d of "
-			     "tty device \"%s\": %s",
-			     tty->master, tty->name, strerror(errno));
+			SYSWARN("Failed to set FD_CLOEXEC flag on master fd %d of "
+			        "tty device \"%s\"", tty->master, tty->name);
 
-		ret = fcntl(tty->slave, F_SETFD, FD_CLOEXEC);
+		ret = fd_cloexec(tty->slave, true);
 		if (ret < 0)
-			WARN("Failed to set FD_CLOEXEC flag on slave fd %d of "
-			     "tty device \"%s\": %s",
-			     tty->slave, tty->name, strerror(errno));
+			SYSWARN("Failed to set FD_CLOEXEC flag on slave fd %d of "
+			        "tty device \"%s\"", tty->slave, tty->name);
 
 		tty->busy = 0;
 	}
 
-	ttys->nbtty = conf->tty;
-
-	INFO("Finished creating %d tty devices", conf->tty);
+	INFO("Finished creating %zu tty devices", ttys->max);
 	return 0;
 }
 
@@ -995,16 +1036,25 @@ void lxc_delete_tty(struct lxc_tty_info *ttys)
 {
 	int i;
 
-	for (i = 0; i < ttys->nbtty; i++) {
+	if (!ttys->tty)
+		return;
+
+	for (i = 0; i < ttys->max; i++) {
 		struct lxc_terminal_info *tty = &ttys->tty[i];
 
-		close(tty->master);
-		close(tty->slave);
+		if (tty->master >= 0) {
+			close(tty->master);
+			tty->master = -EBADF;
+		}
+
+		if (tty->slave >= 0) {
+			close(tty->slave);
+			tty->slave = -EBADF;
+		}
 	}
 
 	free(ttys->tty);
 	ttys->tty = NULL;
-	ttys->nbtty = 0;
 }
 
 static int lxc_send_ttys_to_parent(struct lxc_handler *handler)
@@ -1015,10 +1065,10 @@ static int lxc_send_ttys_to_parent(struct lxc_handler *handler)
 	struct lxc_tty_info *ttys = &conf->ttys;
 	int sock = handler->data_sock[0];
 
-	if (conf->tty == 0)
+	if (ttys->max == 0)
 		return 0;
 
-	for (i = 0; i < conf->tty; i++) {
+	for (i = 0; i < ttys->max; i++) {
 		int ttyfds[2];
 		struct lxc_terminal_info *tty = &ttys->tty[i];
 
@@ -1029,15 +1079,14 @@ static int lxc_send_ttys_to_parent(struct lxc_handler *handler)
 		if (ret < 0)
 			break;
 
-		TRACE("Sent ty \"%s\" with master fd %d and slave fd %d to "
+		TRACE("Sent tty \"%s\" with master fd %d and slave fd %d to "
 		      "parent", tty->name, tty->master, tty->slave);
 	}
 
 	if (ret < 0)
-		ERROR("Failed to send %d ttys to parent: %s", conf->tty,
-		      strerror(errno));
+		SYSERROR("Failed to send %zu ttys to parent", ttys->max);
 	else
-		TRACE("Sent %d ttys to parent", conf->tty);
+		TRACE("Sent %zu ttys to parent", ttys->max);
 
 	return ret;
 }
@@ -1047,7 +1096,7 @@ static int lxc_create_ttys(struct lxc_handler *handler)
 	int ret = -1;
 	struct lxc_conf *conf = handler->conf;
 
-	ret = lxc_allocate_ttys(handler->name, conf);
+	ret = lxc_allocate_ttys(conf);
 	if (ret < 0) {
 		ERROR("Failed to allocate ttys");
 		goto on_error;
@@ -1067,10 +1116,10 @@ static int lxc_create_ttys(struct lxc_handler *handler)
 		}
 	}
 
-	if (conf->pty_names) {
-		ret = setenv("container_ttys", conf->pty_names, 1);
+	if (conf->ttys.tty_names) {
+		ret = setenv("container_ttys", conf->ttys.tty_names, 1);
 		if (ret < 0)
-			SYSERROR("Failed to set \"container_ttys=%s\"", conf->pty_names);
+			SYSERROR("Failed to set \"container_ttys=%s\"", conf->ttys.tty_names);
 	}
 
 	ret = 0;
@@ -1081,154 +1130,102 @@ on_error:
 	return ret;
 }
 
-static int setup_rootfs_pivot_root(const char *rootfs)
-{
-	int ret;
-	int newroot = -1, oldroot = -1;
-
-	oldroot = open("/", O_DIRECTORY | O_RDONLY);
-	if (oldroot < 0) {
-		SYSERROR("Failed to open old root directory");
-		return -1;
-	}
-
-	newroot = open(rootfs, O_DIRECTORY | O_RDONLY);
-	if (newroot < 0) {
-		SYSERROR("Failed to open new root directory");
-		goto on_error;
-	}
-
-	/* change into new root fs */
-	ret = fchdir(newroot);
-	if (ret < 0) {
-		SYSERROR("Failed to change to new rootfs \"%s\"", rootfs);
-		goto on_error;
-	}
-
-	/* pivot_root into our new root fs */
-	ret = pivot_root(".", ".");
-	if (ret < 0) {
-		SYSERROR("Failed to pivot_root()");
-		goto on_error;
-	}
-
-	/* At this point the old-root is mounted on top of our new-root To
-	 * unmounted it we must not be chdir'd into it, so escape back to
-	 * old-root.
-	 */
-	ret = fchdir(oldroot);
-	if (ret < 0) {
-		SYSERROR("Failed to enter old root directory");
-		goto on_error;
-	}
-
-	ret = umount2(".", MNT_DETACH);
-	if (ret < 0) {
-		SYSERROR("Failed to detach old root directory");
-		goto on_error;
-	}
-
-	ret = fchdir(newroot);
-	if (ret < 0) {
-		SYSERROR("Failed to re-enter new root directory");
-		goto on_error;
-	}
-
-	close(oldroot);
-	close(newroot);
-
-	DEBUG("pivot_root(\"%s\") successful", rootfs);
-
-	return 0;
-
-on_error:
-	if (oldroot != -1)
-		close(oldroot);
-	if (newroot != -1)
-		close(newroot);
-
-	return -1;
-}
-
 /* Just create a path for /dev under $lxcpath/$name and in rootfs If we hit an
  * error, log it but don't fail yet.
  */
 static int mount_autodev(const char *name, const struct lxc_rootfs *rootfs,
 			 const char *lxcpath)
 {
+	__do_free char *path = NULL;
 	int ret;
 	size_t clen;
-	char *path;
+	mode_t cur_mask;
 
 	INFO("Preparing \"/dev\"");
 
 	/* $(rootfs->mount) + "/dev/pts" + '\0' */
 	clen = (rootfs->path ? strlen(rootfs->mount) : 0) + 9;
-	path = alloca(clen);
+	path = must_realloc(NULL, clen);
 
 	ret = snprintf(path, clen, "%s/dev", rootfs->path ? rootfs->mount : "");
 	if (ret < 0 || (size_t)ret >= clen)
 		return -1;
 
-	if (!dir_exists(path)) {
-		WARN("\"/dev\" directory does not exist. Proceeding without "
-		     "autodev being set up");
-		return 0;
+	cur_mask = umask(S_IXUSR | S_IXGRP | S_IXOTH);
+	ret = mkdir(path, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+	if (ret < 0 && errno != EEXIST) {
+		SYSERROR("Failed to create \"/dev\" directory");
+		ret = -errno;
+		goto reset_umask;
 	}
 
 	ret = safe_mount("none", path, "tmpfs", 0, "size=500000,mode=755",
 			 rootfs->path ? rootfs->mount : NULL);
 	if (ret < 0) {
 		SYSERROR("Failed to mount tmpfs on \"%s\"", path);
-		return -1;
+		goto reset_umask;
 	}
-	INFO("Mounted tmpfs on \"%s\"", path);
+	TRACE("Mounted tmpfs on \"%s\"", path);
 
 	ret = snprintf(path, clen, "%s/dev/pts", rootfs->path ? rootfs->mount : "");
-	if (ret < 0 || (size_t)ret >= clen)
-		return -1;
+	if (ret < 0 || (size_t)ret >= clen) {
+		ret = -1;
+		goto reset_umask;
+	}
 
 	/* If we are running on a devtmpfs mapping, dev/pts may already exist.
 	 * If not, then create it and exit if that fails...
 	 */
-	if (!dir_exists(path)) {
-		ret = mkdir(path, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
-		if (ret < 0) {
-			SYSERROR("Failed to create directory \"%s\"", path);
-			return -1;
-		}
+	ret = mkdir(path, S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH);
+	if (ret < 0 && errno != EEXIST) {
+		SYSERROR("Failed to create directory \"%s\"", path);
+		ret = -errno;
+		goto reset_umask;
 	}
 
+	ret = 0;
+
+reset_umask:
+	(void)umask(cur_mask);
+
 	INFO("Prepared \"/dev\"");
-	return 0;
+	return ret;
 }
 
-struct lxc_devs {
+struct lxc_device_node {
 	const char *name;
-	mode_t mode;
-	int maj;
-	int min;
+	const mode_t mode;
+	const int maj;
+	const int min;
 };
 
-static const struct lxc_devs lxc_devs[] = {
-	{ "null",    S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 1, 3 },
-	{ "zero",    S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 1, 5 },
+static const struct lxc_device_node lxc_devices[] = {
 	{ "full",    S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 1, 7 },
-	{ "urandom", S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 1, 9 },
+	{ "null",    S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 1, 3 },
 	{ "random",  S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 1, 8 },
 	{ "tty",     S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 5, 0 },
+	{ "urandom", S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 1, 9 },
+	{ "zero",    S_IFCHR | S_IRWXU | S_IRWXG | S_IRWXO, 1, 5 },
+};
+
+
+enum {
+	LXC_DEVNODE_BIND,
+	LXC_DEVNODE_MKNOD,
+	LXC_DEVNODE_PARTIAL,
+	LXC_DEVNODE_OPEN,
 };
 
 static int lxc_fill_autodev(const struct lxc_rootfs *rootfs)
 {
-	int ret;
-	char path[MAXPATHLEN];
-	int i;
+	int i, ret;
+	char path[PATH_MAX];
 	mode_t cmask;
+	int use_mknod = LXC_DEVNODE_MKNOD;
 
-	ret = snprintf(path, MAXPATHLEN, "%s/dev",
+	ret = snprintf(path, PATH_MAX, "%s/dev",
 		       rootfs->path ? rootfs->mount : "");
-	if (ret < 0 || ret >= MAXPATHLEN)
+	if (ret < 0 || ret >= PATH_MAX)
 		return -1;
 
 	/* ignore, just don't try to fill in */
@@ -1238,69 +1235,94 @@ static int lxc_fill_autodev(const struct lxc_rootfs *rootfs)
 	INFO("Populating \"/dev\"");
 
 	cmask = umask(S_IXUSR | S_IXGRP | S_IXOTH);
-	for (i = 0; i < sizeof(lxc_devs) / sizeof(lxc_devs[0]); i++) {
-		const struct lxc_devs *d = &lxc_devs[i];
+	for (i = 0; i < sizeof(lxc_devices) / sizeof(lxc_devices[0]); i++) {
+		char hostpath[PATH_MAX];
+		const struct lxc_device_node *device = &lxc_devices[i];
 
-		ret = snprintf(path, MAXPATHLEN, "%s/dev/%s",
-			       rootfs->path ? rootfs->mount : "", d->name);
-		if (ret < 0 || ret >= MAXPATHLEN)
+		ret = snprintf(path, PATH_MAX, "%s/dev/%s",
+			       rootfs->path ? rootfs->mount : "", device->name);
+		if (ret < 0 || ret >= PATH_MAX)
 			return -1;
 
-		ret = mknod(path, d->mode, makedev(d->maj, d->min));
-		if (ret < 0) {
-			FILE *pathfile;
-			char hostpath[MAXPATHLEN];
+		if (use_mknod >= LXC_DEVNODE_MKNOD) {
+			ret = mknod(path, device->mode, makedev(device->maj, device->min));
+			if (ret == 0 || (ret < 0 && errno == EEXIST)) {
+				DEBUG("Created device node \"%s\"", path);
+			} else if (ret < 0) {
+				if (errno != EPERM) {
+					SYSERROR("Failed to create device node \"%s\"", path);
+					return -1;
+				}
 
-			if (errno == EEXIST) {
-				DEBUG("\"%s\" device already existed", path);
-				continue;
+				use_mknod = LXC_DEVNODE_BIND;
 			}
 
-			/* Unprivileged containers cannot create devices, so
-			 * bind mount the device from the host.
-			 */
-			ret = snprintf(hostpath, MAXPATHLEN, "/dev/%s", d->name);
-			if (ret < 0 || ret >= MAXPATHLEN)
-				return -1;
+			/* Device nodes are fully useable. */
+			if (use_mknod == LXC_DEVNODE_OPEN)
+				continue;
 
-			pathfile = fopen(path, "wb");
-			if (!pathfile) {
+			if (use_mknod == LXC_DEVNODE_MKNOD) {
+				/* See
+				 * - https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit/?id=55956b59df336f6738da916dbb520b6e37df9fbd
+				 * - https://lists.linuxfoundation.org/pipermail/containers/2018-June/039176.html
+				 */
+				ret = open(path, O_RDONLY | O_CLOEXEC);
+				if (ret >= 0) {
+					close_prot_errno_disarm(ret);
+					/* Device nodes are fully useable. */
+					use_mknod = LXC_DEVNODE_OPEN;
+					continue;
+				}
+
+				SYSTRACE("Failed to open \"%s\" device", path);
+				/* Device nodes are only partially useable. */
+				use_mknod = LXC_DEVNODE_PARTIAL;
+			}
+		}
+
+		if (use_mknod != LXC_DEVNODE_PARTIAL) {
+			/* If we are dealing with partially functional device
+			 * nodes the prio mknod() call will have created the
+			 * device node so we can use it as a bind-mount target.
+			 */
+			ret = mknod(path, S_IFREG | 0000, 0);
+			if (ret < 0 && errno != EEXIST) {
 				SYSERROR("Failed to create file \"%s\"", path);
 				return -1;
 			}
-			fclose(pathfile);
-
-			ret = safe_mount(hostpath, path, 0, MS_BIND, NULL,
-					 rootfs->path ? rootfs->mount : NULL);
-			if (ret < 0) {
-				SYSERROR("Failed to bind mount \"%s\" from "
-					 "host into container",
-					 d->name);
-				return -1;
-			}
-			DEBUG("Bind mounted \"%s\" onto \"%s\"", hostpath,
-			      path);
-		} else {
-			DEBUG("Created device node \"%s\"", path);
 		}
+
+		/* Fallback to bind-mounting the device from the host. */
+		ret = snprintf(hostpath, PATH_MAX, "/dev/%s", device->name);
+		if (ret < 0 || ret >= PATH_MAX)
+			return -1;
+
+		ret = safe_mount(hostpath, path, 0, MS_BIND, NULL,
+				 rootfs->path ? rootfs->mount : NULL);
+		if (ret < 0) {
+			SYSERROR("Failed to bind mount host device node \"%s\" "
+				 "onto \"%s\"", hostpath, path);
+			return -1;
+		}
+		DEBUG("Bind mounted host device node \"%s\" onto \"%s\"",
+		      hostpath, path);
 	}
-	umask(cmask);
+	(void)umask(cmask);
 
 	INFO("Populated \"/dev\"");
 	return 0;
 }
 
-static int lxc_setup_rootfs(struct lxc_conf *conf)
+static int lxc_mount_rootfs(struct lxc_conf *conf)
 {
 	int ret;
 	struct lxc_storage *bdev;
-	const struct lxc_rootfs *rootfs;
+	const struct lxc_rootfs *rootfs = &conf->rootfs;
 
-	rootfs = &conf->rootfs;
 	if (!rootfs->path) {
 		ret = mount("", "/", NULL, MS_SLAVE | MS_REC, 0);
 		if (ret < 0) {
-			SYSERROR("Failed to make / rslave");
+			SYSERROR("Failed to remount \"/\" MS_REC | MS_SLAVE");
 			return -1;
 		}
 
@@ -1338,15 +1360,17 @@ static int lxc_setup_rootfs(struct lxc_conf *conf)
 	return 0;
 }
 
-int prepare_ramfs_root(char *root)
+int lxc_chroot(const struct lxc_rootfs *rootfs)
 {
+	__do_free char *nroot = NULL;
 	int i, ret;
-	char *p, *p2;
-	char buf[LXC_LINELEN], nroot[PATH_MAX];
-	FILE *f;
+	char *root = rootfs->mount;
 
-	if (!realpath(root, nroot))
+	nroot = realpath(root, NULL);
+	if (!nroot) {
+		SYSERROR("Failed to resolve \"%s\"", root);
 		return -1;
+	}
 
 	ret = chdir("/");
 	if (ret < 0)
@@ -1355,121 +1379,198 @@ int prepare_ramfs_root(char *root)
 	/* We could use here MS_MOVE, but in userns this mount is locked and
 	 * can't be moved.
 	 */
-	ret = mount(root, "/", NULL, MS_REC | MS_BIND, NULL);
+	ret = mount(nroot, "/", NULL, MS_REC | MS_BIND, NULL);
 	if (ret < 0) {
-		SYSERROR("Failed to move \"%s\" into \"/\"", root);
+		SYSERROR("Failed to mount \"%s\" onto \"/\" as MS_REC | MS_BIND", nroot);
 		return -1;
 	}
 
 	ret = mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 	if (ret < 0) {
-		SYSERROR("Failed to make \"/\" rprivate");
+		SYSERROR("Failed to remount \"/\"");
 		return -1;
 	}
 
-	/* The following code cleans up inhereted mounts which are not required
+	/* The following code cleans up inherited mounts which are not required
 	 * for CT.
 	 *
 	 * The mountinfo file shows not all mounts, if a few points have been
 	 * unmounted between read operations from the mountinfo. So we need to
 	 * read mountinfo a few times.
 	 *
-	 * This loop can be skipped if a container uses unserns, because all
+	 * This loop can be skipped if a container uses userns, because all
 	 * inherited mounts are locked and we should live with all this trash.
 	 */
 	for (;;) {
+		__do_fclose FILE *f = NULL;
+		__do_free char *line = NULL;
+		char *slider1, *slider2;
 		int progress = 0;
+		size_t len = 0;
 
 		f = fopen("./proc/self/mountinfo", "r");
 		if (!f) {
-			SYSERROR("Unable to open /proc/self/mountinfo");
+			SYSERROR("Failed to open \"/proc/self/mountinfo\"");
 			return -1;
 		}
 
-		while (fgets(buf, LXC_LINELEN, f)) {
-			for (p = buf, i=0; p && i < 4; i++)
-				p = strchr(p+1, ' ');
+		while (getline(&line, &len, f) > 0) {
+			for (slider1 = line, i = 0; slider1 && i < 4; i++)
+				slider1 = strchr(slider1 + 1, ' ');
 
-			if (!p)
+			if (!slider1)
 				continue;
 
-			p2 = strchr(p+1, ' ');
-			if (!p2)
+			slider2 = strchr(slider1 + 1, ' ');
+			if (!slider2)
 				continue;
 
-			*p2 = '\0';
-			*p = '.';
+			*slider2 = '\0';
+			*slider1 = '.';
 
-			if (strcmp(p + 1, "/") == 0)
+			if (strcmp(slider1 + 1, "/") == 0)
 				continue;
 
-			if (strcmp(p + 1, "/proc") == 0)
+			if (strcmp(slider1 + 1, "/proc") == 0)
 				continue;
 
-			ret = umount2(p, MNT_DETACH);
+			ret = umount2(slider1, MNT_DETACH);
 			if (ret == 0)
 				progress++;
 		}
-
-		fclose(f);
 
 		if (!progress)
 			break;
 	}
 
-	/* This also can be skipped if a container uses unserns. */
+	/* This also can be skipped if a container uses userns. */
 	(void)umount2("./proc", MNT_DETACH);
 
 	/* It is weird, but chdir("..") moves us in a new root */
 	ret = chdir("..");
 	if (ret < 0) {
-		SYSERROR("Unable to change working directory");
+		SYSERROR("Failed to chdir(\"..\")");
 		return -1;
 	}
 
 	ret = chroot(".");
 	if (ret < 0) {
-		SYSERROR("Unable to chroot");
+		SYSERROR("Failed to chroot(\".\")");
 		return -1;
 	}
 
 	return 0;
 }
 
-static int setup_pivot_root(const struct lxc_rootfs *rootfs)
+/* (The following explanation is copied verbatim from the kernel.)
+ *
+ * pivot_root Semantics:
+ * Moves the root file system of the current process to the directory put_old,
+ * makes new_root as the new root file system of the current process, and sets
+ * root/cwd of all processes which had them on the current root to new_root.
+ *
+ * Restrictions:
+ * The new_root and put_old must be directories, and  must not be on the
+ * same file  system as the current process root. The put_old  must  be
+ * underneath new_root,  i.e. adding a non-zero number of /.. to the string
+ * pointed to by put_old must yield the same directory as new_root. No other
+ * file system may be mounted on put_old. After all, new_root is a mountpoint.
+ *
+ * Also, the current root cannot be on the 'rootfs' (initial ramfs) filesystem.
+ * See Documentation/filesystems/ramfs-rootfs-initramfs.txt for alternatives
+ * in this situation.
+ *
+ * Notes:
+ *  - we don't move root/cwd if they are not at the root (reason: if something
+ *    cared enough to change them, it's probably wrong to force them elsewhere)
+ *  - it's okay to pick a root that isn't the root of a file system, e.g.
+ *    /nfs/my_root where /nfs is the mount point. It must be a mountpoint,
+ *    though, so you may need to say mount --bind /nfs/my_root /nfs/my_root
+ *    first.
+ */
+static int lxc_pivot_root(const char *rootfs)
 {
+	__do_close_prot_errno int oldroot = -EBADF, newroot = -EBADF;
 	int ret;
 
+	oldroot = open("/", O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+	if (oldroot < 0) {
+		SYSERROR("Failed to open old root directory");
+		return -1;
+	}
+
+	newroot = open(rootfs, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+	if (newroot < 0) {
+		SYSERROR("Failed to open new root directory");
+		return -1;
+	}
+
+	/* change into new root fs */
+	ret = fchdir(newroot);
+	if (ret < 0) {
+		SYSERROR("Failed to change to new rootfs \"%s\"", rootfs);
+		return -1;
+	}
+
+	/* pivot_root into our new root fs */
+	ret = pivot_root(".", ".");
+	if (ret < 0) {
+		SYSERROR("Failed to pivot_root()");
+		return -1;
+	}
+
+	/* At this point the old-root is mounted on top of our new-root. To
+	 * unmounted it we must not be chdir'd into it, so escape back to
+	 * old-root.
+	 */
+	ret = fchdir(oldroot);
+	if (ret < 0) {
+		SYSERROR("Failed to enter old root directory");
+		return -1;
+	}
+
+	/* Make oldroot rslave to make sure our umounts don't propagate to the
+	 * host.
+	 */
+	ret = mount("", ".", "", MS_SLAVE | MS_REC, NULL);
+	if (ret < 0) {
+		SYSERROR("Failed to make oldroot rslave");
+		return -1;
+	}
+
+	ret = umount2(".", MNT_DETACH);
+	if (ret < 0) {
+		SYSERROR("Failed to detach old root directory");
+		return -1;
+	}
+
+	ret = fchdir(newroot);
+	if (ret < 0) {
+		SYSERROR("Failed to re-enter new root directory");
+		return -1;
+	}
+
+	TRACE("pivot_root(\"%s\") successful", rootfs);
+
+	return 0;
+}
+
+static int lxc_setup_rootfs_switch_root(const struct lxc_rootfs *rootfs)
+{
 	if (!rootfs->path) {
 		DEBUG("Container does not have a rootfs");
 		return 0;
 	}
 
-	if (detect_ramfs_rootfs()) {
-		DEBUG("Detected that container is on ramfs");
+	if (detect_ramfs_rootfs())
+		return lxc_chroot(rootfs);
 
-		ret = prepare_ramfs_root(rootfs->mount);
-		if (ret < 0) {
-			ERROR("Failed to prepare minimal ramfs root");
-			return -1;
-		}
-
-		DEBUG("Prepared ramfs root for container");
-		return 0;
-	}
-
-	ret = setup_rootfs_pivot_root(rootfs->mount);
-	if (ret < 0) {
-		ERROR("Failed to pivot_root()");
-		return -1;
-	}
-
-	DEBUG("Finished pivot_root()");
-	return 0;
+	return lxc_pivot_root(rootfs->mount);
 }
 
-static struct id_map *find_mapped_nsid_entry(struct lxc_conf *conf, unsigned id,
-					     enum idtype idtype)
+static const struct id_map *find_mapped_nsid_entry(struct lxc_conf *conf,
+						   unsigned id,
+						   enum idtype idtype)
 {
 	struct lxc_list *it;
 	struct id_map *map;
@@ -1501,35 +1602,23 @@ static struct id_map *find_mapped_nsid_entry(struct lxc_conf *conf, unsigned id,
 static int lxc_setup_devpts(struct lxc_conf *conf)
 {
 	int ret;
-	const char *default_devpts_mntopts;
+	char **opts;
 	char devpts_mntopts[256];
+	char *mntopt_sets[5];
+	char default_devpts_mntopts[256] = "gid=5,newinstance,ptmxmode=0666,mode=0620";
 
-	if (conf->pts <= 0) {
+	if (conf->pty_max <= 0) {
 		DEBUG("No new devpts instance will be mounted since no pts "
 		      "devices are requested");
 		return 0;
 	}
 
-	if (!find_mapped_nsid_entry(conf, 5, ID_TYPE_GID))
-		default_devpts_mntopts = "newinstance,ptmxmode=0666,mode=0620";
-	else
-		default_devpts_mntopts = "newinstance,ptmxmode=0666,mode=0620,gid=5";
-
-	ret = snprintf(devpts_mntopts, sizeof(devpts_mntopts), "%s,max=%d",
-		       default_devpts_mntopts, conf->pts);
+	ret = snprintf(devpts_mntopts, sizeof(devpts_mntopts), "%s,max=%zu",
+		       default_devpts_mntopts, conf->pty_max);
 	if (ret < 0 || (size_t)ret >= sizeof(devpts_mntopts))
 		return -1;
 
-	/* Unmount old devpts instance. */
-	ret = access("/dev/pts/ptmx", F_OK);
-	if (!ret) {
-		ret = umount("/dev/pts");
-		if (ret < 0) {
-			SYSERROR("Failed to unmount old devpts instance");
-			return -1;
-		}
-		DEBUG("Unmounted old devpts instance");
-	}
+	(void)umount2("/dev/pts", MNT_DETACH);
 
 	/* Create mountpoint for devpts instance. */
 	ret = mkdir("/dev/pts", 0755);
@@ -1538,32 +1627,51 @@ static int lxc_setup_devpts(struct lxc_conf *conf)
 		return -1;
 	}
 
-	/* Mount new devpts instance. */
-	ret = mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, devpts_mntopts);
+	/* gid=5 && max= */
+	mntopt_sets[0] = devpts_mntopts;
+
+	/* !gid=5 && max= */
+	mntopt_sets[1] = devpts_mntopts + STRLITERALLEN("gid=5") + 1;
+
+	/* gid=5 && !max= */
+	mntopt_sets[2] = default_devpts_mntopts;
+
+	/* !gid=5 && !max= */
+	mntopt_sets[3] = default_devpts_mntopts + STRLITERALLEN("gid=5") + 1;
+
+	/* end */
+	mntopt_sets[4] = NULL;
+
+	for (ret = -1, opts = mntopt_sets; opts && *opts; opts++) {
+		/* mount new devpts instance */
+		ret = mount("devpts", "/dev/pts", "devpts", MS_NOSUID | MS_NOEXEC, *opts);
+		if (ret == 0)
+			break;
+	}
+
 	if (ret < 0) {
 		SYSERROR("Failed to mount new devpts instance");
 		return -1;
 	}
-	DEBUG("Mount new devpts instance with options \"%s\"", devpts_mntopts);
+	DEBUG("Mount new devpts instance with options \"%s\"", *opts);
 
 	/* Remove any pre-existing /dev/ptmx file. */
-	ret = access("/dev/ptmx", F_OK);
-	if (!ret) {
-		ret = remove("/dev/ptmx");
-		if (ret < 0) {
+	ret = remove("/dev/ptmx");
+	if (ret < 0) {
+		if (errno != ENOENT) {
 			SYSERROR("Failed to remove existing \"/dev/ptmx\" file");
 			return -1;
 		}
+	} else {
 		DEBUG("Removed existing \"/dev/ptmx\" file");
 	}
 
 	/* Create dummy /dev/ptmx file as bind mountpoint for /dev/pts/ptmx. */
-	ret = open("/dev/ptmx", O_CREAT, 0666);
-	if (ret < 0) {
+	ret = mknod("/dev/ptmx", S_IFREG | 0000, 0);
+	if (ret < 0 && errno != EEXIST) {
 		SYSERROR("Failed to create dummy \"/dev/ptmx\" file as bind mount target");
 		return -1;
 	}
-	close(ret);
 	DEBUG("Created dummy \"/dev/ptmx\" file as bind mount target");
 
 	/* Fallback option: create symlink /dev/ptmx -> /dev/pts/ptmx  */
@@ -1617,8 +1725,8 @@ static int setup_personality(int persona)
 static int lxc_setup_dev_console(const struct lxc_rootfs *rootfs,
 				 const struct lxc_terminal *console)
 {
-	int fd, ret;
-	char path[MAXPATHLEN];
+	int ret;
+	char path[PATH_MAX];
 	char *rootfs_path = rootfs->path ? rootfs->mount : "";
 
 	if (console->path && !strcmp(console->path, "none"))
@@ -1634,7 +1742,7 @@ static int lxc_setup_dev_console(const struct lxc_rootfs *rootfs,
 	if (file_exists(path)) {
 		ret = lxc_unstack_mountpoint(path, false);
 		if (ret < 0) {
-			ERROR("Failed to unmount \"%s\": %s", path, strerror(errno));
+			SYSERROR("Failed to unmount \"%s\"", path);
 			return -ret;
 		} else {
 			DEBUG("Cleared all (%d) mounts from \"%s\"", ret, path);
@@ -1644,20 +1752,16 @@ static int lxc_setup_dev_console(const struct lxc_rootfs *rootfs,
 	/* For unprivileged containers autodev or automounts will already have
 	 * taken care of creating /dev/console.
 	 */
-	fd = open(path, O_CREAT | O_EXCL, S_IXUSR | S_IXGRP | S_IXOTH);
-	if (fd < 0) {
-		if (errno != EEXIST) {
-			SYSERROR("Failed to create console");
-			return -errno;
-		}
-	} else {
-		close(fd);
+	ret = mknod(path, S_IFREG | 0000, 0);
+	if (ret < 0 && errno != EEXIST) {
+		SYSERROR("Failed to create console");
+		return -errno;
 	}
 
-	ret = chmod(console->name, S_IXUSR | S_IXGRP | S_IXOTH);
+	ret = fchmod(console->slave, S_IXUSR | S_IXGRP);
 	if (ret < 0) {
 		SYSERROR("Failed to set mode \"0%o\" to \"%s\"",
-			 S_IXUSR | S_IXGRP | S_IXOTH, console->name);
+			 S_IXUSR | S_IXGRP, console->name);
 		return -errno;
 	}
 
@@ -1675,8 +1779,8 @@ static int lxc_setup_ttydir_console(const struct lxc_rootfs *rootfs,
 				    const struct lxc_terminal *console,
 				    char *ttydir)
 {
-	int ret, fd;
-	char path[MAXPATHLEN], lxcpath[MAXPATHLEN];
+	int ret;
+	char path[PATH_MAX], lxcpath[PATH_MAX];
 	char *rootfs_path = rootfs->path ? rootfs->mount : "";
 
 	if (console->path && !strcmp(console->path, "none"))
@@ -1698,13 +1802,11 @@ static int lxc_setup_ttydir_console(const struct lxc_rootfs *rootfs,
 	if (ret < 0 || (size_t)ret >= sizeof(lxcpath))
 		return -1;
 
-	ret = creat(lxcpath, 0660);
-	if (ret == -1 && errno != EEXIST) {
+	ret = mknod(lxcpath, S_IFREG | 0000, 0);
+	if (ret < 0 && errno != EEXIST) {
 		SYSERROR("Failed to create \"%s\"", lxcpath);
 		return -errno;
 	}
-	if (ret >= 0)
-		close(ret);
 
 	ret = snprintf(path, sizeof(path), "%s/dev/console", rootfs_path);
 	if (ret < 0 || (size_t)ret >= sizeof(path))
@@ -1713,27 +1815,23 @@ static int lxc_setup_ttydir_console(const struct lxc_rootfs *rootfs,
 	if (file_exists(path)) {
 		ret = lxc_unstack_mountpoint(path, false);
 		if (ret < 0) {
-			ERROR("%s - Failed to unmount \"%s\"", strerror(errno), path);
+			SYSERROR("Failed to unmount \"%s\"", path);
 			return -ret;
 		} else {
 			DEBUG("Cleared all (%d) mounts from \"%s\"", ret, path);
 		}
 	}
 
-	fd = open(path, O_CREAT | O_EXCL, S_IXUSR | S_IXGRP | S_IXOTH);
-	if (fd < 0) {
-		if (errno != EEXIST) {
-			SYSERROR("Failed to create console");
-			return -errno;
-		}
-	} else {
-		close(fd);
+	ret = mknod(path, S_IFREG | 0000, 0);
+	if (ret < 0 && errno != EEXIST) {
+		SYSERROR("Failed to create console");
+		return -errno;
 	}
 
-	ret = chmod(console->name, S_IXUSR | S_IXGRP | S_IXOTH);
+	ret = fchmod(console->slave, S_IXUSR | S_IXGRP);
 	if (ret < 0) {
 		SYSERROR("Failed to set mode \"0%o\" to \"%s\"",
-			 S_IXUSR | S_IXGRP | S_IXOTH, console->name);
+			 S_IXUSR | S_IXGRP, console->name);
 		return -errno;
 	}
 
@@ -1767,7 +1865,7 @@ static int lxc_setup_console(const struct lxc_rootfs *rootfs,
 	return lxc_setup_ttydir_console(rootfs, console, ttydir);
 }
 
-static void parse_mntopt(char *opt, unsigned long *flags, char **data)
+static void parse_mntopt(char *opt, unsigned long *flags, char **data, size_t size)
 {
 	struct mount_opt *mo;
 
@@ -1785,14 +1883,16 @@ static void parse_mntopt(char *opt, unsigned long *flags, char **data)
 	}
 
 	if (strlen(*data))
-		strcat(*data, ",");
-	strcat(*data, opt);
+		(void)strlcat(*data, ",", size);
+
+	(void)strlcat(*data, opt, size);
 }
 
 int parse_mntopts(const char *mntopts, unsigned long *mntflags, char **mntdata)
 {
-	char *data, *p, *s;
-	char *saveptr = NULL;
+	__do_free char *data = NULL, *s = NULL;
+	char *p;
+	size_t size;
 
 	*mntdata = NULL;
 	*mntflags = 0L;
@@ -1804,21 +1904,17 @@ int parse_mntopts(const char *mntopts, unsigned long *mntflags, char **mntdata)
 	if (!s)
 		return -1;
 
-	data = malloc(strlen(s) + 1);
-	if (!data) {
-		free(s);
+	size = strlen(s) + 1;
+	data = malloc(size);
+	if (!data)
 		return -1;
-	}
 	*data = 0;
 
-	for (; (p = strtok_r(s, ",", &saveptr)); s = NULL)
-		parse_mntopt(p, mntflags, &data);
+	lxc_iterate_parts(p, s, ",")
+		parse_mntopt(p, mntflags, &data, size);
 
 	if (*data)
-		*mntdata = data;
-	else
-		free(data);
-	free(s);
+		*mntdata = move_ptr(data);
 
 	return 0;
 }
@@ -1841,10 +1937,10 @@ static void parse_propagationopt(char *opt, unsigned long *flags)
 	}
 }
 
-static int parse_propagationopts(const char *mntopts, unsigned long *pflags)
+int parse_propagationopts(const char *mntopts, unsigned long *pflags)
 {
-	char *p, *s;
-	char *saveptr = NULL;
+	__do_free char *s = NULL;
+	char *p;
 
 	if (!mntopts)
 		return 0;
@@ -1856,9 +1952,8 @@ static int parse_propagationopts(const char *mntopts, unsigned long *pflags)
 	}
 
 	*pflags = 0L;
-	for (; (p = strtok_r(s, ",", &saveptr)); s = NULL)
+	lxc_iterate_parts(p, s, ",")
 		parse_propagationopt(p, pflags);
-	free(s);
 
 	return 0;
 }
@@ -1895,15 +1990,15 @@ static int mount_entry(const char *fsname, const char *target,
 		       bool dev, bool relative, const char *rootfs)
 {
 	int ret;
-	char srcbuf[MAXPATHLEN];
+	char srcbuf[PATH_MAX];
 	const char *srcpath = fsname;
 #ifdef HAVE_STATVFS
 	struct statvfs sb;
 #endif
 
 	if (relative) {
-		ret = snprintf(srcbuf, MAXPATHLEN, "%s/%s", rootfs ? rootfs : "/", fsname ? fsname : "");
-		if (ret < 0 || ret >= MAXPATHLEN) {
+		ret = snprintf(srcbuf, PATH_MAX, "%s/%s", rootfs ? rootfs : "/", fsname ? fsname : "");
+		if (ret < 0 || ret >= PATH_MAX) {
 			ERROR("source path is too long");
 			return -1;
 		}
@@ -1914,9 +2009,8 @@ static int mount_entry(const char *fsname, const char *target,
 			 rootfs);
 	if (ret < 0) {
 		if (optional) {
-			INFO("%s - Failed to mount \"%s\" on \"%s\" "
-			     "(optional)", strerror(errno),
-			     srcpath ? srcpath : "(null)", target);
+			SYSINFO("Failed to mount \"%s\" on \"%s\" (optional)",
+			        srcpath ? srcpath : "(null)", target);
 			return 0;
 		}
 
@@ -1972,10 +2066,8 @@ static int mount_entry(const char *fsname, const char *target,
 		ret = mount(srcpath, target, fstype, mountflags | MS_REMOUNT, data);
 		if (ret < 0) {
 			if (optional) {
-				INFO("Failed to mount \"%s\" on \"%s\" "
-				     "(optional): %s",
-				     srcpath ? srcpath : "(null)", target,
-				     strerror(errno));
+				SYSINFO("Failed to mount \"%s\" on \"%s\" (optional)",
+				        srcpath ? srcpath : "(null)", target);
 				return 0;
 			}
 
@@ -1985,12 +2077,15 @@ static int mount_entry(const char *fsname, const char *target,
 		}
 	}
 
+#ifdef HAVE_STATVFS
+skipremount:
+#endif
 	if (pflags) {
 		ret = mount(NULL, target, NULL, pflags, NULL);
 		if (ret < 0) {
 			if (optional) {
-				INFO("%s - Failed to change mount propagation "
-				     "for \"%s\" (optional)", strerror(errno), target);
+				SYSINFO("Failed to change mount propagation "
+				        "for \"%s\" (optional)", target);
 				return 0;
 			} else {
 				SYSERROR("Failed to change mount propagation "
@@ -2001,10 +2096,6 @@ static int mount_entry(const char *fsname, const char *target,
 		DEBUG("Changed mount propagation for \"%s\"", target);
 	}
 
-
-#ifdef HAVE_STATVFS
-skipremount:
-#endif
 	DEBUG("Mounted \"%s\" on \"%s\" with filesystem type \"%s\"",
 	      srcpath ? srcpath : "(null)", target, fstype);
 
@@ -2046,8 +2137,9 @@ static int mount_entry_create_dir_file(const struct mntent *mntent,
 				       const struct lxc_rootfs *rootfs,
 				       const char *lxc_name, const char *lxc_path)
 {
-	int fd, ret;
-	char *p1, *p2;
+	__do_free char *p1 = NULL;
+	int ret;
+	char *p2;
 
 	if (strncmp(mntent->mnt_type, "overlay", 7) == 0) {
 		ret = ovl_mkdir(mntent, rootfs, lxc_name, lxc_path);
@@ -2077,16 +2169,14 @@ static int mount_entry_create_dir_file(const struct mntent *mntent,
 	p2 = dirname(p1);
 
 	ret = mkdir_p(p2, 0755);
-	free(p1);
 	if (ret < 0 && errno != EEXIST) {
 		SYSERROR("Failed to create directory \"%s\"", path);
 		return -1;
 	}
 
-	fd = open(path, O_CREAT, 0644);
-	if (fd < 0)
-		return -1;
-	close(fd);
+	ret = mknod(path, S_IFREG | 0000, 0);
+	if (ret < 0 && errno != EEXIST)
+		return -errno;
 
 	return 0;
 }
@@ -2099,9 +2189,9 @@ static inline int mount_entry_on_generic(struct mntent *mntent,
 					 const char *lxc_name,
 					 const char *lxc_path)
 {
+	__do_free char *mntdata = NULL;
 	int ret;
 	unsigned long mntflags;
-	char *mntdata;
 	bool dev, optional, relative;
 	unsigned long pflags = 0;
 	char *rootfs_path = NULL;
@@ -2134,14 +2224,13 @@ static inline int mount_entry_on_generic(struct mntent *mntent,
 	ret = mount_entry(mntent->mnt_fsname, path, mntent->mnt_type, mntflags,
 			  pflags, mntdata, optional, dev, relative, rootfs_path);
 
-	free(mntdata);
 	return ret;
 }
 
 static inline int mount_entry_on_systemfs(struct mntent *mntent)
 {
 	int ret;
-	char path[MAXPATHLEN];
+	char path[PATH_MAX];
 
 	/* For containers created without a rootfs all mounts are treated as
 	 * absolute paths starting at / on the host.
@@ -2164,7 +2253,7 @@ static int mount_entry_on_absolute_rootfs(struct mntent *mntent,
 	int offset;
 	char *aux;
 	const char *lxcpath;
-	char path[MAXPATHLEN];
+	char path[PATH_MAX];
 	int ret = 0;
 
 	lxcpath = lxc_global_config_value("lxc.lxcpath");
@@ -2174,8 +2263,8 @@ static int mount_entry_on_absolute_rootfs(struct mntent *mntent,
 	/* If rootfs->path is a blockdev path, allow container fstab to use
 	 * <lxcpath>/<name>/rootfs" as the target prefix.
 	 */
-	ret = snprintf(path, MAXPATHLEN, "%s/%s/rootfs", lxcpath, lxc_name);
-	if (ret < 0 || ret >= MAXPATHLEN)
+	ret = snprintf(path, PATH_MAX, "%s/%s/rootfs", lxcpath, lxc_name);
+	if (ret < 0 || ret >= PATH_MAX)
 		goto skipvarlib;
 
 	aux = strstr(mntent->mnt_dir, path);
@@ -2193,8 +2282,8 @@ skipvarlib:
 	offset = strlen(rootfs->path);
 
 skipabs:
-	ret = snprintf(path, MAXPATHLEN, "%s/%s", rootfs->mount, aux + offset);
-	if (ret < 0 || ret >= MAXPATHLEN)
+	ret = snprintf(path, PATH_MAX, "%s/%s", rootfs->mount, aux + offset);
+	if (ret < 0 || ret >= PATH_MAX)
 		return -1;
 
 	return mount_entry_on_generic(mntent, path, rootfs, lxc_name, lxc_path);
@@ -2206,7 +2295,7 @@ static int mount_entry_on_relative_rootfs(struct mntent *mntent,
 					  const char *lxc_path)
 {
 	int ret;
-	char path[MAXPATHLEN];
+	char path[PATH_MAX];
 
 	/* relative to root mount point */
 	ret = snprintf(path, sizeof(path), "%s/%s", rootfs->mount, mntent->mnt_dir);
@@ -2220,11 +2309,12 @@ static int mount_file_entries(const struct lxc_conf *conf,
 			      const struct lxc_rootfs *rootfs, FILE *file,
 			      const char *lxc_name, const char *lxc_path)
 {
-	char buf[4096];
+	char buf[PATH_MAX];
 	struct mntent mntent;
-	int ret = -1;
 
 	while (getmntent_r(file, &mntent, buf, sizeof(buf))) {
+		int ret;
+
 		if (!rootfs->path)
 			ret = mount_entry_on_systemfs(&mntent);
 		else if (mntent.mnt_dir[0] != '/')
@@ -2232,14 +2322,17 @@ static int mount_file_entries(const struct lxc_conf *conf,
 							     lxc_name, lxc_path);
 		else
 			ret = mount_entry_on_absolute_rootfs(&mntent, rootfs,
-					                     lxc_name, lxc_path);
+							     lxc_name, lxc_path);
 		if (ret < 0)
 			return -1;
 	}
-	ret = 0;
 
-	INFO("Finished setting up mounts");
-	return ret;
+	if (!feof(file) || ferror(file)) {
+		ERROR("Failed to parse mount entries");
+		return -1;
+	}
+
+	return 0;
 }
 
 static int setup_mount(const struct lxc_conf *conf,
@@ -2266,28 +2359,42 @@ static int setup_mount(const struct lxc_conf *conf,
 	return ret;
 }
 
-FILE *make_anonymous_mount_file(struct lxc_list *mount)
+/*
+ * In order for nested containers to be able to mount /proc and /sys they need
+ * to see a "pure" proc and sysfs mount points with nothing mounted on top
+ * (like lxcfs).
+ * For this we provide proc and sysfs in /dev/.lxc/{proc,sys} while using an
+ * apparmor rule to deny access to them. This is mostly for convenience: The
+ * container's root user can mount them anyway and thus has access to the two
+ * file systems. But a non-root user in the container should not be allowed to
+ * access them as a side effect without explicitly allowing it.
+ */
+static const char nesting_helpers[] =
+"proc dev/.lxc/proc proc create=dir,optional 0 0\n"
+"sys dev/.lxc/sys sysfs create=dir,optional 0 0\n";
+
+FILE *make_anonymous_mount_file(struct lxc_list *mount,
+				bool include_nesting_helpers)
 {
+	__do_close_prot_errno int fd = -EBADF;
 	int ret;
 	char *mount_entry;
 	struct lxc_list *iterator;
-	int fd = -1;
 
 	fd = memfd_create(".lxc_mount_file", MFD_CLOEXEC);
 	if (fd < 0) {
+		char template[] = P_tmpdir "/.lxc_mount_file_XXXXXX";
+
 		if (errno != ENOSYS)
 			return NULL;
-		fd = lxc_make_tmpfile((char *){P_tmpdir "/.lxc_mount_file"}, true);
+
+		fd = lxc_make_tmpfile(template, true);
 		if (fd < 0) {
 			SYSERROR("Could not create temporary mount file");
 			return NULL;
 		}
 
 		TRACE("Created temporary mount file");
-	}
-	if (fd < 0) {
-		SYSERROR("Could not create temporary mount file");
-		return NULL;
 	}
 
 	lxc_list_for_each (iterator, mount) {
@@ -2296,25 +2403,27 @@ FILE *make_anonymous_mount_file(struct lxc_list *mount)
 		mount_entry = iterator->elem;
 		len = strlen(mount_entry);
 
-		ret = write(fd, mount_entry, len);
+		ret = lxc_write_nointr(fd, mount_entry, len);
 		if (ret != len)
-			goto on_error;
+			return NULL;
 
-		ret = write(fd, "\n", 1);
+		ret = lxc_write_nointr(fd, "\n", 1);
 		if (ret != 1)
-			goto on_error;
+			return NULL;
+	}
+
+	if (include_nesting_helpers) {
+		ret = lxc_write_nointr(fd, nesting_helpers,
+				       STRARRAYLEN(nesting_helpers));
+		if (ret != STRARRAYLEN(nesting_helpers))
+			return NULL;
 	}
 
 	ret = lseek(fd, 0, SEEK_SET);
 	if (ret < 0)
-		goto on_error;
+		return NULL;
 
-	return fdopen(fd, "r+");
-
-on_error:
-	SYSERROR("Failed to write mount entry to temporary mount file");
-	close(fd);
-	return NULL;
+	return fdopen(move_fd(fd), "r+");
 }
 
 static int setup_mount_entries(const struct lxc_conf *conf,
@@ -2322,17 +2431,13 @@ static int setup_mount_entries(const struct lxc_conf *conf,
 			       struct lxc_list *mount, const char *lxc_name,
 			       const char *lxc_path)
 {
-	int ret;
-	FILE *f;
+	__do_fclose FILE *f = NULL;
 
-	f = make_anonymous_mount_file(mount);
+	f = make_anonymous_mount_file(mount, conf->lsm_aa_allow_nesting);
 	if (!f)
 		return -1;
 
-	ret = mount_file_entries(conf, rootfs, f, lxc_name, lxc_path);
-	fclose(f);
-
-	return ret;
+	return mount_file_entries(conf, rootfs, f, lxc_name, lxc_path);
 }
 
 static int parse_cap(const char *cap)
@@ -2403,7 +2508,8 @@ static int setup_caps(struct lxc_list *caps)
 			return -1;
 		}
 
-		ret = prctl(PR_CAPBSET_DROP, capid, 0, 0, 0);
+		ret = prctl(PR_CAPBSET_DROP, prctl_arg(capid), prctl_arg(0),
+			    prctl_arg(0), prctl_arg(0));
 		if (ret < 0) {
 			SYSERROR("Failed to remove %s capability", drop_entry);
 			return -1;
@@ -2417,6 +2523,7 @@ static int setup_caps(struct lxc_list *caps)
 
 static int dropcaps_except(struct lxc_list *caps)
 {
+	__do_free int *caplist = NULL;
 	int i, capid, numcaps;
 	char *keep_entry;
 	struct lxc_list *iterator;
@@ -2427,7 +2534,7 @@ static int dropcaps_except(struct lxc_list *caps)
 	TRACE("Found %d capabilities", numcaps);
 
 	/* caplist[i] is 1 if we keep capability i */
-	int *caplist = alloca(numcaps * sizeof(int));
+	caplist = must_realloc(NULL, numcaps * sizeof(int));
 	memset(caplist, 0, numcaps * sizeof(int));
 
 	lxc_list_for_each (iterator, caps) {
@@ -2452,7 +2559,8 @@ static int dropcaps_except(struct lxc_list *caps)
 		if (caplist[i])
 			continue;
 
-		ret = prctl(PR_CAPBSET_DROP, i, 0, 0, 0);
+		ret = prctl(PR_CAPBSET_DROP, prctl_arg(i), prctl_arg(0),
+			    prctl_arg(0), prctl_arg(0));
 		if (ret < 0) {
 			SYSERROR("Failed to remove capability %d", i);
 			return -1;
@@ -2501,12 +2609,13 @@ int setup_resource_limits(struct lxc_list *limits, pid_t pid)
 
 #if HAVE_PRLIMIT || HAVE_PRLIMIT64
 		if (prlimit(pid, resid, &lim->limit, NULL) != 0) {
-			ERROR("Failed to set limit %s: %s", lim->resource,
-			      strerror(errno));
+			SYSERROR("Failed to set limit %s", lim->resource);
 			return -1;
 		}
+
+		TRACE("Setup \"%s\" limit", lim->resource);
 #else
-		ERROR("Cannot set limit %s as prlimit is missing", lim->resource);
+		ERROR("Cannot set limit \"%s\" as prlimit is missing", lim->resource);
 		return -1;
 #endif
 	}
@@ -2516,11 +2625,11 @@ int setup_resource_limits(struct lxc_list *limits, pid_t pid)
 
 int setup_sysctl_parameters(struct lxc_list *sysctls)
 {
+	__do_free char *tmp = NULL;
 	struct lxc_list *it;
 	struct lxc_sysctl *elem;
 	int ret = 0;
-	char *tmp = NULL;
-	char filename[MAXPATHLEN] = {0};
+	char filename[PATH_MAX] = {0};
 
 	lxc_list_for_each (it, sysctls) {
 		elem = it->elem;
@@ -2531,17 +2640,16 @@ int setup_sysctl_parameters(struct lxc_list *sysctls)
 		}
 
 		ret = snprintf(filename, sizeof(filename), "/proc/sys/%s", tmp);
-		free(tmp);
 		if (ret < 0 || (size_t)ret >= sizeof(filename)) {
 			ERROR("Error setting up sysctl parameters path");
 			return -1;
 		}
 
 		ret = lxc_write_to_file(filename, elem->value,
-					strlen(elem->value), false);
+					strlen(elem->value), false, 0666);
 		if (ret < 0) {
-			ERROR("Failed to setup sysctl parameters %s to %s",
-			      elem->key, elem->value);
+			SYSERROR("Failed to setup sysctl parameters %s to %s",
+			         elem->key, elem->value);
 			return -1;
 		}
 	}
@@ -2551,11 +2659,11 @@ int setup_sysctl_parameters(struct lxc_list *sysctls)
 
 int setup_proc_filesystem(struct lxc_list *procs, pid_t pid)
 {
+	__do_free char *tmp = NULL;
 	struct lxc_list *it;
 	struct lxc_proc *elem;
 	int ret = 0;
-	char *tmp = NULL;
-	char filename[MAXPATHLEN] = {0};
+	char filename[PATH_MAX] = {0};
 
 	lxc_list_for_each (it, procs) {
 		elem = it->elem;
@@ -2566,17 +2674,16 @@ int setup_proc_filesystem(struct lxc_list *procs, pid_t pid)
 		}
 
 		ret = snprintf(filename, sizeof(filename), "/proc/%d/%s", pid, tmp);
-		free(tmp);
 		if (ret < 0 || (size_t)ret >= sizeof(filename)) {
 			ERROR("Error setting up proc filesystem path");
 			return -1;
 		}
 
 		ret = lxc_write_to_file(filename, elem->value,
-					strlen(elem->value), false);
+					strlen(elem->value), false, 0666);
 		if (ret < 0) {
-			ERROR("Failed to setup proc filesystem %s to %s",
-			      elem->filename, elem->value);
+			SYSERROR("Failed to setup proc filesystem %s to %s",
+			         elem->filename, elem->value);
 			return -1;
 		}
 	}
@@ -2613,12 +2720,14 @@ struct lxc_conf *lxc_conf_init(void)
 	new->console.name[0] = '\0';
 	memset(&new->console.ringbuf, 0, sizeof(struct lxc_ringbuf));
 	new->maincmd_fd = -1;
+	new->monitor_signal_pdeath = SIGKILL;
 	new->nbd_idx = -1;
 	new->rootfs.mount = strdup(default_rootfs_mount);
 	if (!new->rootfs.mount) {
 		free(new);
 		return NULL;
 	}
+	new->rootfs.managed = true;
 	new->logfd = -1;
 	lxc_list_init(&new->cgroup);
 	lxc_list_init(&new->cgroup2);
@@ -2641,8 +2750,12 @@ struct lxc_conf *lxc_conf_init(void)
 	lxc_list_init(&new->groups);
 	lxc_list_init(&new->state_clients);
 	new->lsm_aa_profile = NULL;
+	lxc_list_init(&new->lsm_aa_raw);
 	new->lsm_se_context = NULL;
+	new->tmp_umount_proc = false;
 	new->tmp_umount_proc = 0;
+	new->shmount.path_host = NULL;
+	new->shmount.path_cont = NULL;
 
 	/* if running in a new user namespace, init and COMMAND
 	 * default to running as UID/GID 0 when using lxc-execute */
@@ -2657,39 +2770,37 @@ struct lxc_conf *lxc_conf_init(void)
 int write_id_mapping(enum idtype idtype, pid_t pid, const char *buf,
 		     size_t buf_size)
 {
-	int fd, ret;
-	char path[MAXPATHLEN];
+	__do_close_prot_errno int fd = -EBADF;
+	int ret;
+	char path[PATH_MAX];
 
 	if (geteuid() != 0 && idtype == ID_TYPE_GID) {
-		size_t buflen;
+		__do_close_prot_errno int setgroups_fd = -EBADF;
 
-		ret = snprintf(path, MAXPATHLEN, "/proc/%d/setgroups", pid);
-		if (ret < 0 || ret >= MAXPATHLEN)
+		ret = snprintf(path, PATH_MAX, "/proc/%d/setgroups", pid);
+		if (ret < 0 || ret >= PATH_MAX)
 			return -E2BIG;
 
-		fd = open(path, O_WRONLY);
-		if (fd < 0 && errno != ENOENT) {
+		setgroups_fd = open(path, O_WRONLY);
+		if (setgroups_fd < 0 && errno != ENOENT) {
 			SYSERROR("Failed to open \"%s\"", path);
 			return -1;
 		}
 
-		if (fd >= 0) {
-			buflen = sizeof("deny\n") - 1;
-			errno = 0;
-			ret = lxc_write_nointr(fd, "deny\n", buflen);
-			if (ret != buflen) {
-				SYSERROR("Failed to write \"deny\" to "
-					 "\"/proc/%d/setgroups\"", pid);
-				close(fd);
+		if (setgroups_fd >= 0) {
+			ret = lxc_write_nointr(setgroups_fd, "deny\n",
+					       STRLITERALLEN("deny\n"));
+			if (ret != STRLITERALLEN("deny\n")) {
+				SYSERROR("Failed to write \"deny\" to \"/proc/%d/setgroups\"", pid);
 				return -1;
 			}
-			close(fd);
+			TRACE("Wrote \"deny\" to \"/proc/%d/setgroups\"", pid);
 		}
 	}
 
-	ret = snprintf(path, MAXPATHLEN, "/proc/%d/%cid_map", pid,
+	ret = snprintf(path, PATH_MAX, "/proc/%d/%cid_map", pid,
 		       idtype == ID_TYPE_UID ? 'u' : 'g');
-	if (ret < 0 || ret >= MAXPATHLEN)
+	if (ret < 0 || ret >= PATH_MAX)
 		return -E2BIG;
 
 	fd = open(path, O_WRONLY);
@@ -2698,15 +2809,12 @@ int write_id_mapping(enum idtype idtype, pid_t pid, const char *buf,
 		return -1;
 	}
 
-	errno = 0;
 	ret = lxc_write_nointr(fd, buf, buf_size);
 	if (ret != buf_size) {
 		SYSERROR("Failed to write %cid mapping to \"%s\"",
 			 idtype == ID_TYPE_UID ? 'u' : 'g', path);
-		close(fd);
 		return -1;
 	}
-	close(fd);
 
 	return 0;
 }
@@ -2720,29 +2828,27 @@ int write_id_mapping(enum idtype idtype, pid_t pid, const char *buf,
  */
 static int idmaptool_on_path_and_privileged(const char *binary, cap_value_t cap)
 {
-	char *path;
+	__do_free char *path = NULL;
 	int ret;
 	struct stat st;
-	int fret = 0;
 
+	errno = EINVAL;
 	if (cap != CAP_SETUID && cap != CAP_SETGID)
-		return -EINVAL;
+		return -1;
 
+	errno = ENOENT;
 	path = on_path(binary, NULL);
 	if (!path)
-		return -ENOENT;
+		return -1;
 
 	ret = stat(path, &st);
-	if (ret < 0) {
-		fret = -errno;
-		goto cleanup;
-	}
+	if (ret < 0)
+		return -1;
 
 	/* Check if the binary is setuid. */
 	if (st.st_mode & S_ISUID) {
 		DEBUG("The binary \"%s\" does have the setuid bit set", path);
-		fret = 1;
-		goto cleanup;
+		return 1;
 	}
 
 #if HAVE_LIBCAP && LIBCAP_SUPPORTS_FILE_CAPABILITIES
@@ -2752,8 +2858,7 @@ static int idmaptool_on_path_and_privileged(const char *binary, cap_value_t cap)
 	    lxc_file_cap_is_set(path, CAP_SETUID, CAP_PERMITTED)) {
 		DEBUG("The binary \"%s\" has CAP_SETUID in its CAP_EFFECTIVE "
 		      "and CAP_PERMITTED sets", path);
-		fret = 1;
-		goto cleanup;
+		return 1;
 	}
 
 	/* Check if it has the CAP_SETGID capability. */
@@ -2762,22 +2867,18 @@ static int idmaptool_on_path_and_privileged(const char *binary, cap_value_t cap)
 	    lxc_file_cap_is_set(path, CAP_SETGID, CAP_PERMITTED)) {
 		DEBUG("The binary \"%s\" has CAP_SETGID in its CAP_EFFECTIVE "
 		      "and CAP_PERMITTED sets", path);
-		fret = 1;
-		goto cleanup;
+		return 1;
 	}
 #else
 	/* If we cannot check for file capabilities we need to give the benefit
 	 * of the doubt. Otherwise we might fail even though all the necessary
 	 * file capabilities are set.
 	 */
-	DEBUG("Cannot check for file capabilites as full capability support is "
+	DEBUG("Cannot check for file capabilities as full capability support is "
 	      "missing. Manual intervention needed");
-	fret = 1;
 #endif
 
-cleanup:
-	free(path);
-	return fret;
+	return 1;
 }
 
 int lxc_map_ids_exec_wrapper(void *args)
@@ -2791,7 +2892,7 @@ int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 	int fill, left;
 	char u_or_g;
 	char *pos;
-	char cmd_output[MAXPATHLEN];
+	char cmd_output[PATH_MAX];
 	struct id_map *map;
 	struct lxc_list *iterator;
 	enum idtype type;
@@ -2799,7 +2900,7 @@ int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 	 * +
 	 * strlen(" ") = 1
 	 * +
-	 * LXC_NUMSTRLEN64
+	 * INTTYPE_TO_STRLEN(uint32_t)
 	 * +
 	 * strlen(" ") = 1
 	 *
@@ -2807,8 +2908,12 @@ int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 	 * LXC_IDMAPLEN bytes available for our the {g,u]id mapping.
 	 */
 	int ret = 0, gidmap = 0, uidmap = 0;
-	char mapbuf[9 + 1 + LXC_NUMSTRLEN64 + 1 + LXC_IDMAPLEN] = {0};
+	char mapbuf[9 + 1 + INTTYPE_TO_STRLEN(uint32_t) + 1 + LXC_IDMAPLEN] = {0};
 	bool had_entry = false, use_shadow = false;
+	int hostuid, hostgid;
+
+	hostuid = geteuid();
+	hostgid = getegid();
 
 	/* If new{g,u}idmap exists, that is, if shadow is handing out subuid
 	 * ranges, then insist that root also reserve ranges in subuid. This
@@ -2837,7 +2942,25 @@ int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 		 * doing so by requiring geteuid() == 0.
 		 */
 		DEBUG("No newuidmap and newgidmap binary found. Trying to "
-		      "write directly with euid %d", geteuid());
+		      "write directly with euid %d", hostuid);
+	}
+
+	/* Check if we really need to use newuidmap and newgidmap.
+	* If the user is only remapping his own {g,u}id, we don't need it.
+	*/
+	if (use_shadow && lxc_list_len(idmap) == 2) {
+		use_shadow = false;
+		lxc_list_for_each(iterator, idmap) {
+			map = iterator->elem;
+			if (map->idtype == ID_TYPE_UID && map->range == 1 &&
+			    map->nsid == hostuid && map->hostid == hostuid)
+				continue;
+			if (map->idtype == ID_TYPE_GID && map->range == 1 &&
+			    map->nsid == hostgid && map->hostid == hostgid)
+				continue;
+			use_shadow = true;
+			break;
+		}
 	}
 
 	for (type = ID_TYPE_UID, u_or_g = 'u'; type <= ID_TYPE_GID;
@@ -2872,7 +2995,7 @@ int lxc_map_ids(struct lxc_list *idmap, pid_t pid)
 		if (!had_entry)
 			continue;
 
-		/* Try to catch the ouput of new{g,u}idmap to make debugging
+		/* Try to catch the output of new{g,u}idmap to make debugging
 		 * easier.
 		 */
 		if (use_shadow) {
@@ -3002,7 +3125,7 @@ int chown_mapped_root(const char *path, struct lxc_conf *conf)
 			 "-m", map5,
 			 "--", "chown", ugid, path,
 			 NULL};
-	char cmd_output[MAXPATHLEN];
+	char cmd_output[PATH_MAX];
 
 	hostuid = geteuid();
 	hostgid = getegid();
@@ -3125,7 +3248,7 @@ int lxc_create_tmp_proc_mount(struct lxc_conf *conf)
 		if (conf->rootfs.path)
 			return -1;
 	} else if (mounted == 1) {
-		conf->tmp_umount_proc = 1;
+		conf->tmp_umount_proc = true;
 	}
 
 	return 0;
@@ -3133,29 +3256,74 @@ int lxc_create_tmp_proc_mount(struct lxc_conf *conf)
 
 void tmp_proc_unmount(struct lxc_conf *lxc_conf)
 {
-	if (lxc_conf->tmp_umount_proc != 1)
+	if (!lxc_conf->tmp_umount_proc)
 		return;
 
-	umount("/proc");
-	lxc_conf->tmp_umount_proc = 0;
+	(void)umount2("/proc", MNT_DETACH);
+	lxc_conf->tmp_umount_proc = false;
 }
 
 /* Walk /proc/mounts and change any shared entries to slave. */
 void remount_all_slave(void)
 {
-	FILE *f;
+	__do_free char *line = NULL;
+	__do_fclose FILE *f = NULL;
+	__do_close_prot_errno int memfd = -EBADF, mntinfo_fd = -EBADF;
+	int ret;
+	ssize_t copied;
 	size_t len = 0;
-	char *line = NULL;
 
-	f = fopen("/proc/self/mountinfo", "r");
-	if (!f) {
-		SYSERROR("Failed to open \"/proc/self/mountinfo\" to mark all shared");
-		ERROR("Continuing container startup...");
+	mntinfo_fd = open("/proc/self/mountinfo", O_RDONLY | O_CLOEXEC);
+	if (mntinfo_fd < 0) {
+		SYSERROR("Failed to open \"/proc/self/mountinfo\"");
 		return;
 	}
 
+	memfd = memfd_create(".lxc_mountinfo", MFD_CLOEXEC);
+	if (memfd < 0) {
+		char template[] = P_tmpdir "/.lxc_mountinfo_XXXXXX";
+
+		if (errno != ENOSYS) {
+			SYSERROR("Failed to create temporary in-memory file");
+			return;
+		}
+
+		memfd = lxc_make_tmpfile(template, true);
+		if (memfd < 0) {
+			WARN("Failed to create temporary file");
+			return;
+		}
+	}
+
+again:
+	copied = lxc_sendfile_nointr(memfd, mntinfo_fd, NULL, LXC_SENDFILE_MAX);
+	if (copied < 0) {
+		if (errno == EINTR)
+			goto again;
+
+		SYSERROR("Failed to copy \"/proc/self/mountinfo\"");
+		return;
+	}
+
+	ret = lseek(memfd, 0, SEEK_SET);
+	if (ret < 0) {
+		SYSERROR("Failed to reset file descriptor offset");
+		return;
+	}
+
+	f = fdopen(memfd, "r");
+	if (!f) {
+		SYSERROR("Failed to open copy of \"/proc/self/mountinfo\" to mark all shared. Continuing");
+		return;
+	}
+
+	/*
+	 * After a successful fdopen() memfd will be closed when calling
+	 * fclose(f). Calling close(memfd) afterwards is undefined.
+	 */
+	move_fd(memfd);
+
 	while (getline(&line, &len, f) != -1) {
-		int ret;
 		char *opts, *target;
 
 		target = get_field(line, 4);
@@ -3175,22 +3343,31 @@ void remount_all_slave(void)
 		if (ret < 0) {
 			SYSERROR("Failed to make \"%s\" MS_SLAVE", target);
 			ERROR("Continuing...");
+			continue;
 		}
+		TRACE("Remounted \"%s\" as MS_SLAVE", target);
 	}
-	fclose(f);
-	free(line);
+	TRACE("Remounted all mount table entries as MS_SLAVE");
 }
 
-static int lxc_execute_bind_init(struct lxc_conf *conf)
+static int lxc_execute_bind_init(struct lxc_handler *handler)
 {
 	int ret;
-	char path[PATH_MAX], destpath[PATH_MAX], *p;
+	char *p;
+	char path[PATH_MAX], destpath[PATH_MAX];
+	struct lxc_conf *conf = handler->conf;
 
 	/* If init exists in the container, don't bind mount a static one */
 	p = choose_init(conf->rootfs.mount);
 	if (p) {
-		free(p);
-		return 0;
+		__do_free char *old = p;
+
+		p = strdup(old + strlen(conf->rootfs.mount));
+		if (!p)
+			return -ENOMEM;
+
+		INFO("Found existing init at \"%s\"", p);
+		goto out;
 	}
 
 	ret = snprintf(path, PATH_MAX, SBINDIR "/init.lxc.static");
@@ -3202,20 +3379,16 @@ static int lxc_execute_bind_init(struct lxc_conf *conf)
 		return -1;
 	}
 
-	ret = snprintf(destpath, PATH_MAX, "%s%s", conf->rootfs.mount, "/init.lxc.static");
+	ret = snprintf(destpath, PATH_MAX, "%s" P_tmpdir "%s", conf->rootfs.mount, "/.lxc-init");
 	if (ret < 0 || ret >= PATH_MAX)
 		return -1;
 
 	if (!file_exists(destpath)) {
-		FILE *pathfile;
-
-		pathfile = fopen(destpath, "wb");
-		if (!pathfile) {
-			SYSERROR("Failed to create mount target \"%s\"", destpath);
+		ret = mknod(destpath, S_IFREG | 0000, 0);
+		if (ret < 0 && errno != EEXIST) {
+			SYSERROR("Failed to create dummy \"%s\" file as bind mount target", destpath);
 			return -1;
 		}
-
-		fclose(pathfile);
 	}
 
 	ret = safe_mount(path, destpath, "none", MS_BIND, NULL, conf->rootfs.mount);
@@ -3224,14 +3397,22 @@ static int lxc_execute_bind_init(struct lxc_conf *conf)
 		return -1;
 	}
 
+	p = strdup(destpath + strlen(conf->rootfs.mount));
+	if (!p)
+		return -ENOMEM;
+
 	INFO("Bind mounted lxc.init.static into container at \"%s\"", path);
+out:
+	((struct execute_args *)handler->data)->init_fd = -1;
+	((struct execute_args *)handler->data)->init_path = p;
 	return 0;
 }
 
 /* This does the work of remounting / if it is shared, calling the container
  * pre-mount hooks, and mounting the rootfs.
  */
-int do_rootfs_setup(struct lxc_conf *conf, const char *name, const char *lxcpath)
+int lxc_setup_rootfs_prepare_root(struct lxc_conf *conf, const char *name,
+				  const char *lxcpath)
 {
 	int ret;
 
@@ -3259,7 +3440,7 @@ int do_rootfs_setup(struct lxc_conf *conf, const char *name, const char *lxcpath
 		return -1;
 	}
 
-	ret = lxc_setup_rootfs(conf);
+	ret = lxc_mount_rootfs(conf);
 	if (ret < 0) {
 		ERROR("Failed to setup rootfs for");
 		return -1;
@@ -3271,23 +3452,22 @@ int do_rootfs_setup(struct lxc_conf *conf, const char *name, const char *lxcpath
 
 static bool verify_start_hooks(struct lxc_conf *conf)
 {
-	char path[MAXPATHLEN];
+	char path[PATH_MAX];
 	struct lxc_list *it;
 
 	lxc_list_for_each (it, &conf->hooks[LXCHOOK_START]) {
 		int ret;
-		struct stat st;
 		char *hookname = it->elem;
 
-		ret = snprintf(path, MAXPATHLEN, "%s%s",
+		ret = snprintf(path, PATH_MAX, "%s%s",
 			       conf->rootfs.path ? conf->rootfs.mount : "",
 			       hookname);
-		if (ret < 0 || ret >= MAXPATHLEN)
+		if (ret < 0 || ret >= PATH_MAX)
 			return false;
 
-		ret = stat(path, &st);
+		ret = access(path, X_OK);
 		if (ret < 0) {
-			SYSERROR("Start hook %s not found in container",
+			SYSERROR("Start hook \"%s\" not found in container",
 				 hookname);
 			return false;
 		}
@@ -3298,13 +3478,22 @@ static bool verify_start_hooks(struct lxc_conf *conf)
 	return true;
 }
 
+static bool execveat_supported(void)
+{
+	lxc_raw_execveat(-1, "", NULL, NULL, AT_EMPTY_PATH);
+	if (errno == ENOSYS)
+		return false;
+
+	return true;
+}
+
 int lxc_setup(struct lxc_handler *handler)
 {
 	int ret;
 	const char *lxcpath = handler->lxcpath, *name = handler->name;
 	struct lxc_conf *lxc_conf = handler->conf;
 
-	ret = do_rootfs_setup(lxc_conf, name, lxcpath);
+	ret = lxc_setup_rootfs_prepare_root(lxc_conf, name, lxcpath);
 	if (ret < 0) {
 		ERROR("Failed to setup rootfs");
 		return -1;
@@ -3317,6 +3506,10 @@ int lxc_setup(struct lxc_handler *handler)
 			return -1;
 		}
 	}
+
+	ret = lxc_setup_keyring();
+	if (ret < 0)
+		return -1;
 
 	ret = lxc_setup_network_in_child_namespaces(lxc_conf, &lxc_conf->network);
 	if (ret < 0) {
@@ -3353,15 +3546,31 @@ int lxc_setup(struct lxc_handler *handler)
 		return -1;
 	}
 
-	/* Make sure any start hooks are in the container */
-	if (!verify_start_hooks(lxc_conf))
-		return -1;
-
 	if (lxc_conf->is_execute) {
-		ret = lxc_execute_bind_init(lxc_conf);
-		if (ret < 0) {
-			ERROR("Failed to bind-mount the lxc init system");
-			return -1;
+		if (execveat_supported()) {
+			int fd;
+			char path[PATH_MAX];
+
+			ret = snprintf(path, PATH_MAX, SBINDIR "/init.lxc.static");
+			if (ret < 0 || ret >= PATH_MAX) {
+				ERROR("Path to init.lxc.static too long");
+				return -1;
+			}
+
+			fd = open(path, O_PATH | O_CLOEXEC);
+			if (fd < 0) {
+				SYSERROR("Unable to open lxc.init.static");
+				return -1;
+			}
+
+			((struct execute_args *)handler->data)->init_fd = fd;
+			((struct execute_args *)handler->data)->init_path = NULL;
+		} else {
+			ret = lxc_execute_bind_init(handler);
+			if (ret < 0) {
+				ERROR("Failed to bind-mount the lxc init system");
+				return -1;
+			}
 		}
 	}
 
@@ -3404,8 +3613,14 @@ int lxc_setup(struct lxc_handler *handler)
 		}
 	}
 
+	/* Make sure any start hooks are in the container */
+	if (!verify_start_hooks(lxc_conf)) {
+		ERROR("Failed to verify start hooks");
+		return -1;
+	}
+
 	ret = lxc_setup_console(&lxc_conf->rootfs, &lxc_conf->console,
-				lxc_conf->ttydir);
+				lxc_conf->ttys.dir);
 	if (ret < 0) {
 		ERROR("Failed to setup console");
 		return -1;
@@ -3423,7 +3638,7 @@ int lxc_setup(struct lxc_handler *handler)
 		return -1;
 	}
 
-	ret = setup_pivot_root(&lxc_conf->rootfs);
+	ret = lxc_setup_rootfs_switch_root(&lxc_conf->rootfs);
 	if (ret < 0) {
 		ERROR("Failed to pivot root into rootfs");
 		return -1;
@@ -3565,6 +3780,16 @@ int lxc_clear_config_keepcaps(struct lxc_conf *c)
 	return 0;
 }
 
+int lxc_clear_namespace(struct lxc_conf *c)
+{
+	int i;
+	for (i = 0; i < LXC_NS_MAX; i++) {
+		free(c->ns_share[i]);
+		c->ns_share[i] = NULL;
+	}
+	return 0;
+}
+
 int lxc_clear_cgroups(struct lxc_conf *c, const char *key, int version)
 {
 	char *global_token, *namespaced_token;
@@ -3576,12 +3801,12 @@ int lxc_clear_cgroups(struct lxc_conf *c, const char *key, int version)
 	if (version == CGROUP2_SUPER_MAGIC) {
 		global_token = "lxc.cgroup2";
 		namespaced_token = "lxc.cgroup2.";
-		namespaced_token_len = sizeof("lxc.cgroup2.") - 1;
+		namespaced_token_len = STRLITERALLEN("lxc.cgroup2.");
 		list = &c->cgroup2;
 	} else if (version == CGROUP_SUPER_MAGIC) {
 		global_token = "lxc.cgroup";
 		namespaced_token = "lxc.cgroup.";
-		namespaced_token_len = sizeof("lxc.cgroup.") - 1;
+		namespaced_token_len = STRLITERALLEN("lxc.cgroup.");
 		list = &c->cgroup;
 	} else {
 		return -EINVAL;
@@ -3589,7 +3814,7 @@ int lxc_clear_cgroups(struct lxc_conf *c, const char *key, int version)
 
 	if (strcmp(key, global_token) == 0)
 		all = true;
-	else if (strncmp(key, namespaced_token, sizeof(namespaced_token) - 1) == 0)
+	else if (strncmp(key, namespaced_token, namespaced_token_len) == 0)
 		k += namespaced_token_len;
 	else
 		return -EINVAL;
@@ -3618,10 +3843,10 @@ int lxc_clear_limits(struct lxc_conf *c, const char *key)
 
 	if (strcmp(key, "lxc.limit") == 0 || strcmp(key, "lxc.prlimit") == 0)
 		all = true;
-	else if (strncmp(key, "lxc.limit.", sizeof("lxc.limit.") - 1) == 0)
-		k = key + sizeof("lxc.limit.") - 1;
-	else if (strncmp(key, "lxc.prlimit.", sizeof("lxc.prlimit.") - 1) == 0)
-		k = key + sizeof("lxc.prlimit.") - 1;
+	else if (strncmp(key, "lxc.limit.", STRLITERALLEN("lxc.limit.")) == 0)
+		k = key + STRLITERALLEN("lxc.limit.");
+	else if (strncmp(key, "lxc.prlimit.", STRLITERALLEN("lxc.prlimit.")) == 0)
+		k = key + STRLITERALLEN("lxc.prlimit.");
 	else
 		return -1;
 
@@ -3648,8 +3873,8 @@ int lxc_clear_sysctls(struct lxc_conf *c, const char *key)
 
 	if (strcmp(key, "lxc.sysctl") == 0)
 		all = true;
-	else if (strncmp(key, "lxc.sysctl.", sizeof("lxc.sysctl.") - 1) == 0)
-		k = key + sizeof("lxc.sysctl.") - 1;
+	else if (strncmp(key, "lxc.sysctl.", STRLITERALLEN("lxc.sysctl.")) == 0)
+		k = key + STRLITERALLEN("lxc.sysctl.");
 	else
 		return -1;
 
@@ -3677,8 +3902,8 @@ int lxc_clear_procs(struct lxc_conf *c, const char *key)
 
 	if (strcmp(key, "lxc.proc") == 0)
 		all = true;
-	else if (strncmp(key, "lxc.proc.", sizeof("lxc.proc.") - 1) == 0)
-		k = key + sizeof("lxc.proc.") - 1;
+	else if (strncmp(key, "lxc.proc.", STRLITERALLEN("lxc.proc.")) == 0)
+		k = key + STRLITERALLEN("lxc.proc.");
 	else
 		return -1;
 
@@ -3752,8 +3977,8 @@ int lxc_clear_hooks(struct lxc_conf *c, const char *key)
 
 	if (strcmp(key, "lxc.hook") == 0)
 		all = true;
-	else if (strncmp(key, "lxc.hook.", sizeof("lxc.hook.") - 1) == 0)
-		k = key + sizeof("lxc.hook.") - 1;
+	else if (strncmp(key, "lxc.hook.", STRLITERALLEN("lxc.hook.")) == 0)
+		k = key + STRLITERALLEN("lxc.hook.");
 	else
 		return -1;
 
@@ -3799,6 +4024,19 @@ void lxc_clear_includes(struct lxc_conf *conf)
 	}
 }
 
+int lxc_clear_apparmor_raw(struct lxc_conf *c)
+{
+	struct lxc_list *it, *next;
+
+	lxc_list_for_each_safe (it, &c->lsm_aa_raw, next) {
+		lxc_list_del(it);
+		free(it->elem);
+		free(it);
+	}
+
+	return 0;
+}
+
 void lxc_conf_free(struct lxc_conf *conf)
 {
 	if (!conf)
@@ -3815,17 +4053,18 @@ void lxc_conf_free(struct lxc_conf *conf)
 	if (conf->logfd != -1)
 		close(conf->logfd);
 	free(conf->utsname);
-	free(conf->ttydir);
+	free(conf->ttys.dir);
+	free(conf->ttys.tty_names);
 	free(conf->fstab);
 	free(conf->rcfile);
 	free(conf->execute_cmd);
 	free(conf->init_cmd);
 	free(conf->init_cwd);
 	free(conf->unexpanded_config);
-	free(conf->pty_names);
 	free(conf->syslog);
 	lxc_free_networks(&conf->network);
 	free(conf->lsm_aa_profile);
+	free(conf->lsm_aa_profile_computed);
 	free(conf->lsm_se_context);
 	lxc_seccomp_free(conf);
 	lxc_clear_config_caps(conf);
@@ -3842,8 +4081,12 @@ void lxc_conf_free(struct lxc_conf *conf)
 	lxc_clear_limits(conf, "lxc.prlimit");
 	lxc_clear_sysctls(conf, "lxc.sysctl");
 	lxc_clear_procs(conf, "lxc.proc");
+	lxc_clear_apparmor_raw(conf);
+	lxc_clear_namespace(conf);
 	free(conf->cgroup_meta.dir);
 	free(conf->cgroup_meta.controllers);
+	free(conf->shmount.path_host);
+	free(conf->shmount.path_cont);
 	free(conf);
 }
 
@@ -3856,6 +4099,7 @@ struct userns_fn_data {
 
 static int run_userns_fn(void *data)
 {
+	int ret;
 	char c;
 	struct userns_fn_data *d = data;
 
@@ -3865,14 +4109,14 @@ static int run_userns_fn(void *data)
 	/* Wait for parent to finish establishing a new mapping in the user
 	 * namespace we are executing in.
 	 */
-	if (read(d->p[0], &c, 1) != 1)
-		return -1;
-
+	ret = lxc_read_nointr(d->p[0], &c, 1);
 	/* Close read end of the pipe. */
 	close(d->p[0]);
+	if (ret != 1)
+		return -1;
 
 	if (d->fn_name)
-		TRACE("calling function \"%s\"", d->fn_name);
+		TRACE("Calling function \"%s\"", d->fn_name);
 
 	/* Call function to run. */
 	return d->fn(d->arg);
@@ -3881,7 +4125,8 @@ static int run_userns_fn(void *data)
 static struct id_map *mapped_nsid_add(struct lxc_conf *conf, unsigned id,
 				      enum idtype idtype)
 {
-	struct id_map *map, *retmap;
+	const struct id_map *map;
+	struct id_map *retmap;
 
 	map = find_mapped_nsid_entry(conf, id, idtype);
 	if (!map)
@@ -3952,18 +4197,20 @@ static struct id_map *mapped_hostid_add(struct lxc_conf *conf, uid_t id,
 
 struct lxc_list *get_minimal_idmap(struct lxc_conf *conf)
 {
+	__do_free struct id_map *container_root_uid = NULL,
+				*container_root_gid = NULL,
+				*host_uid_map = NULL, *host_gid_map = NULL;
+	__do_free struct lxc_list *idmap = NULL;
 	uid_t euid, egid;
 	uid_t nsuid = (conf->root_nsuid_map != NULL) ? 0 : conf->init_uid;
 	gid_t nsgid = (conf->root_nsgid_map != NULL) ? 0 : conf->init_gid;
-	struct lxc_list *idmap = NULL, *tmplist = NULL;
-	struct id_map *container_root_uid = NULL, *container_root_gid = NULL,
-		      *host_uid_map = NULL, *host_gid_map = NULL;
+	struct lxc_list *tmplist = NULL;
 
 	/* Find container root mappings. */
 	container_root_uid = mapped_nsid_add(conf, nsuid, ID_TYPE_UID);
 	if (!container_root_uid) {
 		DEBUG("Failed to find mapping for namespace uid %d", 0);
-		goto on_error;
+		return NULL;
 	}
 	euid = geteuid();
 	if (euid >= container_root_uid->hostid &&
@@ -3973,7 +4220,7 @@ struct lxc_list *get_minimal_idmap(struct lxc_conf *conf)
 	container_root_gid = mapped_nsid_add(conf, nsgid, ID_TYPE_GID);
 	if (!container_root_gid) {
 		DEBUG("Failed to find mapping for namespace gid %d", 0);
-		goto on_error;
+		return NULL;
 	}
 	egid = getegid();
 	if (egid >= container_root_gid->hostid &&
@@ -3985,82 +4232,68 @@ struct lxc_list *get_minimal_idmap(struct lxc_conf *conf)
 		host_uid_map = mapped_hostid_add(conf, euid, ID_TYPE_UID);
 	if (!host_uid_map) {
 		DEBUG("Failed to find mapping for uid %d", euid);
-		goto on_error;
+		return NULL;
 	}
 
 	if (!host_gid_map)
 		host_gid_map = mapped_hostid_add(conf, egid, ID_TYPE_GID);
 	if (!host_gid_map) {
 		DEBUG("Failed to find mapping for gid %d", egid);
-		goto on_error;
+		return NULL;
 	}
 
 	/* Allocate new {g,u}id map list. */
 	idmap = malloc(sizeof(*idmap));
 	if (!idmap)
-		goto on_error;
+		return NULL;
 	lxc_list_init(idmap);
 
 	/* Add container root to the map. */
 	tmplist = malloc(sizeof(*tmplist));
 	if (!tmplist)
-		goto on_error;
+		return NULL;
 	lxc_list_add_elem(tmplist, container_root_uid);
 	lxc_list_add_tail(idmap, tmplist);
 
 	if (host_uid_map && (host_uid_map != container_root_uid)) {
 		/* idmap will now keep track of that memory. */
-		container_root_uid = NULL;
+		move_ptr(container_root_uid);
 
 		/* Add container root to the map. */
 		tmplist = malloc(sizeof(*tmplist));
 		if (!tmplist)
-			goto on_error;
+			return NULL;
 		lxc_list_add_elem(tmplist, host_uid_map);
 		lxc_list_add_tail(idmap, tmplist);
 	}
 	/* idmap will now keep track of that memory. */
-	container_root_uid = NULL;
+	move_ptr(container_root_uid);
 	/* idmap will now keep track of that memory. */
-	host_uid_map = NULL;
+	move_ptr(host_uid_map);
 
 	tmplist = malloc(sizeof(*tmplist));
 	if (!tmplist)
-		goto on_error;
+		return NULL;
 	lxc_list_add_elem(tmplist, container_root_gid);
 	lxc_list_add_tail(idmap, tmplist);
 
 	if (host_gid_map && (host_gid_map != container_root_gid)) {
 		/* idmap will now keep track of that memory. */
-		container_root_gid = NULL;
+		move_ptr(container_root_gid);
 
 		tmplist = malloc(sizeof(*tmplist));
 		if (!tmplist)
-			goto on_error;
+			return NULL;
 		lxc_list_add_elem(tmplist, host_gid_map);
 		lxc_list_add_tail(idmap, tmplist);
 	}
 	/* idmap will now keep track of that memory. */
-	container_root_gid = NULL;
+	move_ptr(container_root_gid);
 	/* idmap will now keep track of that memory. */
-	host_gid_map = NULL;
+	move_ptr(host_gid_map);
 
 	TRACE("Allocated minimal idmapping");
-	return idmap;
-
-on_error:
-	if (idmap)
-		lxc_free_idmap(idmap);
-	if (container_root_uid)
-		free(container_root_uid);
-	if (container_root_gid)
-		free(container_root_gid);
-	if (host_uid_map && (host_uid_map != container_root_uid))
-		free(host_uid_map);
-	if (host_gid_map && (host_gid_map != container_root_gid))
-		free(host_gid_map);
-
-	return NULL;
+	return move_ptr(idmap);
 }
 
 /* Run a function in a new user namespace.
@@ -4070,8 +4303,8 @@ on_error:
  * This means we require only to establish a mapping from:
  * - the container root {g,u}id as seen from the host > user's host {g,u}id
  * - the container root -> some sub{g,u}id
- * The former we add, if the user did not specifiy a mapping. The latter we
- * retrieve from the ontainer's configured {g,u}id mappings as it must have been
+ * The former we add, if the user did not specify a mapping. The latter we
+ * retrieve from the container's configured {g,u}id mappings as it must have been
  * there to start the container in the first place.
  */
 int userns_exec_1(struct lxc_conf *conf, int (*fn)(void *), void *data,
@@ -4084,11 +4317,14 @@ int userns_exec_1(struct lxc_conf *conf, int (*fn)(void *), void *data,
 	int ret = -1, status = -1;
 	char c = '1';
 
+	if (!conf)
+		return -EINVAL;
+
 	idmap = get_minimal_idmap(conf);
 	if (!idmap)
 		return -1;
 
-	ret = pipe(p);
+	ret = pipe2(p, O_CLOEXEC);
 	if (ret < 0) {
 		SYSERROR("Failed to create pipe");
 		return -1;
@@ -4132,7 +4368,7 @@ int userns_exec_1(struct lxc_conf *conf, int (*fn)(void *), void *data,
 	}
 
 	/* Tell child to proceed. */
-	if (write(p[1], &c, 1) != 1) {
+	if (lxc_write_nointr(p[1], &c, 1) != 1) {
 		SYSERROR("Failed telling child process \"%d\" to proceed", pid);
 		goto on_error;
 	}
@@ -4167,7 +4403,10 @@ int userns_exec_full(struct lxc_conf *conf, int (*fn)(void *), void *data,
 	struct id_map *container_root_uid = NULL, *container_root_gid = NULL,
 		      *host_uid_map = NULL, *host_gid_map = NULL;
 
-	ret = pipe(p);
+	if (!conf)
+		return -EINVAL;
+
+	ret = pipe2(p, O_CLOEXEC);
 	if (ret < 0) {
 		SYSERROR("opening pipe");
 		return -1;
@@ -4306,7 +4545,7 @@ int userns_exec_full(struct lxc_conf *conf, int (*fn)(void *), void *data,
 	}
 
 	/* Tell child to proceed. */
-	if (write(p[1], &c, 1) != 1) {
+	if (lxc_write_nointr(p[1], &c, 1) != 1) {
 		SYSERROR("Failed telling child process \"%d\" to proceed", pid);
 		goto on_error;
 	}
@@ -4320,8 +4559,11 @@ on_error:
 	if (pid > 0)
 		ret = wait_for_pid(pid);
 
-	if (idmap)
+	if (idmap) {
 		lxc_free_idmap(idmap);
+		free(idmap);
+	}
+
 	if (host_uid_map && (host_uid_map != container_root_uid))
 		free(host_uid_map);
 	if (host_gid_map && (host_gid_map != container_root_gid))
@@ -4333,55 +4575,84 @@ on_error:
 /* not thread-safe, do not use from api without first forking */
 static char *getuname(void)
 {
-	struct passwd *result;
+	__do_free char *buf = NULL;
+	struct passwd pwent;
+	struct passwd *pwentp = NULL;
+	size_t bufsize;
+	int ret;
 
-	result = getpwuid(geteuid());
-	if (!result)
+	bufsize = sysconf(_SC_GETPW_R_SIZE_MAX);
+	if (bufsize == -1)
+		bufsize = 1024;
+
+	buf = malloc(bufsize);
+	if (!buf)
 		return NULL;
 
-	return strdup(result->pw_name);
+	ret = getpwuid_r(geteuid(), &pwent, buf, bufsize, &pwentp);
+	if (!pwentp) {
+		if (ret == 0)
+			WARN("Could not find matched password record.");
+
+		ERROR("Failed to get password record - %u", geteuid());
+		return NULL;
+	}
+
+	return strdup(pwent.pw_name);
 }
 
 /* not thread-safe, do not use from api without first forking */
 static char *getgname(void)
 {
-	struct group *result;
+	__do_free char *buf = NULL;
+	struct group grent;
+	struct group *grentp = NULL;
+	size_t bufsize;
+	int ret;
 
-	result = getgrgid(getegid());
-	if (!result)
+	bufsize = sysconf(_SC_GETGR_R_SIZE_MAX);
+	if (bufsize == -1)
+		bufsize = 1024;
+
+	buf = malloc(bufsize);
+	if (!buf)
 		return NULL;
 
-	return strdup(result->gr_name);
+	ret = getgrgid_r(getegid(), &grent, buf, bufsize, &grentp);
+	if (!grentp) {
+		if (ret == 0)
+			WARN("Could not find matched group record");
+
+		ERROR("Failed to get group record - %u", getegid());
+		return NULL;
+	}
+
+	return strdup(grent.gr_name);
 }
 
 /* not thread-safe, do not use from api without first forking */
 void suggest_default_idmap(void)
 {
-	char *uname, *gname;
-	FILE *f;
+	__do_free char *gname = NULL, *line = NULL, *uname = NULL;
+	__do_fclose FILE *subuid_f = NULL, *subgid_f = NULL;
 	unsigned int uid = 0, urange = 0, gid = 0, grange = 0;
 	size_t len = 0;
-	char *line = NULL;
 
 	uname = getuname();
 	if (!uname)
 		return;
 
 	gname = getgname();
-	if (!gname) {
-		free(uname);
+	if (!gname)
 		return;
-	}
 
-	f = fopen(subuidfile, "r");
-	if (!f) {
+	subuid_f = fopen(subuidfile, "r");
+	if (!subuid_f) {
 		ERROR("Your system is not configured with subuids");
-		free(gname);
-		free(uname);
 		return;
 	}
 
-	while (getline(&line, &len, f) != -1) {
+	while (getline(&line, &len, subuid_f) != -1) {
 		char *p, *p2;
 		size_t no_newline = 0;
 
@@ -4411,17 +4682,14 @@ void suggest_default_idmap(void)
 		if (lxc_safe_uint(p2, &urange) < 0)
 			WARN("Could not parse UID range");
 	}
-	fclose(f);
 
-	f = fopen(subgidfile, "r");
-	if (!f) {
+	subgid_f = fopen(subgidfile, "r");
+	if (!subgid_f) {
 		ERROR("Your system is not configured with subgids");
-		free(gname);
-		free(uname);
 		return;
 	}
 
-	while (getline(&line, &len, f) != -1) {
+	while (getline(&line, &len, subgid_f) != -1) {
 		char *p, *p2;
 		size_t no_newline = 0;
 
@@ -4451,9 +4719,6 @@ void suggest_default_idmap(void)
 		if (lxc_safe_uint(p2, &grange) < 0)
 			WARN("Could not parse GID range");
 	}
-	fclose(f);
-
-	free(line);
 
 	if (!urange || !grange) {
 		ERROR("You do not have subuids or subgids allocated");
@@ -4467,9 +4732,6 @@ void suggest_default_idmap(void)
 	ERROR("lxc.include = %s", LXC_DEFAULT_CONFIG);
 	ERROR("lxc.idmap = u 0 %u %u", uid, urange);
 	ERROR("lxc.idmap = g 0 %u %u", gid, grange);
-
-	free(gname);
-	free(uname);
 }
 
 static void free_cgroup_settings(struct lxc_list *result)

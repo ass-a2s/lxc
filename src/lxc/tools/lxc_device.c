@@ -19,32 +19,35 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <libgen.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <lxc/lxccontainer.h>
 
+#include "../../include/netns_ifaddrs.h"
 #include "arguments.h"
-#include "tool_utils.h"
+#include "config.h"
+#include "log.h"
+#include "utils.h"
 
-#if HAVE_IFADDRS_H
-#include <ifaddrs.h>
-#else
-#include "include/ifaddrs.h"
-#endif
+lxc_log_define(lxc_device, lxc);
+
+static bool is_interface(const char *dev_name, pid_t pid);
 
 static const struct option my_longopts[] = {
 	LXC_COMMON_OPTIONS
 };
 
 static struct lxc_arguments my_args = {
-	.progname = "lxc-device",
-	.help     = "\
+	.progname     = "lxc-device",
+	.help         = "\
 --name=NAME -- add|del DEV\n\
 \n\
 lxc-device attach or detach DEV to or from container.\n\
@@ -52,46 +55,47 @@ lxc-device attach or detach DEV to or from container.\n\
 Options :\n\
   -n, --name=NAME      NAME of the container\n\
   --rcfile=FILE        Load configuration file FILE\n",
-	.options  = my_longopts,
-	.parser   = NULL,
-	.checker  = NULL,
+	.options      = my_longopts,
+	.parser       = NULL,
+	.checker      = NULL,
+	.log_priority = "ERROR",
+	.log_file     = "none",
 };
 
-static bool is_interface(const char* dev_name, pid_t pid)
+static bool is_interface(const char *dev_name, pid_t pid)
 {
 	pid_t p = fork();
-
 	if (p < 0) {
-		fprintf(stderr, "failed to fork task.\n");
+		ERROR("Failed to fork task");
 		exit(EXIT_FAILURE);
 	}
 
 	if (p == 0) {
-		struct ifaddrs *interfaceArray = NULL, *tempIfAddr = NULL;
+		struct netns_ifaddrs *interfaceArray = NULL, *tempIfAddr = NULL;
 
 		if (!switch_to_ns(pid, "net")) {
-			fprintf(stderr, "failed to enter netns of container.\n");
-			exit(-1);
+			ERROR("Failed to enter netns of container");
+			_exit(-1);
 		}
 
 		/* Grab the list of interfaces */
-		if (getifaddrs(&interfaceArray)) {
-			fprintf(stderr, "failed to get interfaces list\n");
-			exit(-1);
+		if (netns_getifaddrs(&interfaceArray, -1, &(bool){false})) {
+			ERROR("Failed to get interfaces list");
+			_exit(-1);
 		}
 
 		/* Iterate through the interfaces */
 		for (tempIfAddr = interfaceArray; tempIfAddr != NULL; tempIfAddr = tempIfAddr->ifa_next) {
-			if (strcmp(tempIfAddr->ifa_name, dev_name) == 0) {
-				exit(EXIT_SUCCESS);
-			}
+			if (strncmp(tempIfAddr->ifa_name, dev_name, strlen(tempIfAddr->ifa_name)) == 0)
+				_exit(EXIT_SUCCESS);
 		}
-		exit(EXIT_FAILURE);
+
+		_exit(EXIT_FAILURE);
 	}
 
-	if (wait_for_pid(p) == 0) {
+	if (wait_for_pid(p) == 0)
 		return true;
-	}
+
 	return false;
 }
 
@@ -103,15 +107,12 @@ int main(int argc, char *argv[])
 	bool ret = false;
 
 	if (geteuid() != 0) {
-		fprintf(stderr, "%s must be run as root\n", argv[0]);
+		ERROR("%s must be run as root", argv[0]);
 		exit(EXIT_FAILURE);
 	}
 
 	if (lxc_arguments_parse(&my_args, argc, argv))
-		goto err;
-
-	if (!my_args.log_file)
-		my_args.log_file = "none";
+		exit(EXIT_FAILURE);
 
 	log.name = my_args.name;
 	log.file = my_args.log_file;
@@ -121,71 +122,73 @@ int main(int argc, char *argv[])
 	log.lxcpath = my_args.lxcpath[0];
 
 	if (lxc_log_init(&log))
-		goto err;
+		exit(EXIT_FAILURE);
 
 	c = lxc_container_new(my_args.name, my_args.lxcpath[0]);
 	if (!c) {
-		fprintf(stderr, "%s doesn't exist\n", my_args.name);
-		goto err;
+		ERROR("%s doesn't exist", my_args.name);
+		exit(EXIT_FAILURE);
 	}
 
 	if (my_args.rcfile) {
 		c->clear_config(c);
+
 		if (!c->load_config(c, my_args.rcfile)) {
-			fprintf(stderr, "Failed to load rcfile\n");
-			goto err1;
+			ERROR("Failed to load rcfile");
+			goto err;
 		}
+
 		c->configfile = strdup(my_args.rcfile);
 		if (!c->configfile) {
-			fprintf(stderr, "Out of memory setting new config filename\n");
-			goto err1;
+			ERROR("Out of memory setting new config filename");
+			goto err;
 		}
 	}
 
 	if (!c->is_running(c)) {
-		fprintf(stderr, "Container %s is not running.\n", c->name);
-		goto err1;
+		ERROR("Container %s is not running", c->name);
+		goto err;
 	}
 
 	if (my_args.argc < 2) {
-		fprintf(stderr, "Error: no command given (Please see --help output)\n");
-		goto err1;
+		ERROR("Error: no command given (Please see --help output)");
+		goto err;
 	}
 
 	cmd = my_args.argv[0];
 	dev_name = my_args.argv[1];
+
 	if (my_args.argc < 3)
 		dst_name = dev_name;
 	else
 		dst_name = my_args.argv[2];
 
-	if (strcmp(cmd, "add") == 0) {
-		if (is_interface(dev_name, 1)) {
+	if (strncmp(cmd, "add", strlen(cmd)) == 0) {
+		if (is_interface(dev_name, 1))
 			ret = c->attach_interface(c, dev_name, dst_name);
-		} else {
+		else
 			ret = c->add_device_node(c, dev_name, dst_name);
-		}
 		if (ret != true) {
-			fprintf(stderr, "Failed to add %s to %s.\n", dev_name, c->name);
-			goto err1;
+			ERROR("Failed to add %s to %s", dev_name, c->name);
+			goto err;
 		}
-	} else if (strcmp(cmd, "del") == 0) {
-		if (is_interface(dev_name, c->init_pid(c))) {
+	} else if (strncmp(cmd, "del", strlen(cmd)) == 0) {
+		if (is_interface(dev_name, c->init_pid(c)))
 			ret = c->detach_interface(c, dev_name, dst_name);
-		} else {
+		else
 			ret = c->remove_device_node(c, dev_name, dst_name);
-		}
 		if (ret != true) {
-			fprintf(stderr, "Failed to del %s from %s.\n", dev_name, c->name);
-			goto err1;
+			ERROR("Failed to del %s from %s", dev_name, c->name);
+			goto err;
 		}
 	} else {
-		fprintf(stderr, "Error: Please use add or del (Please see --help output)\n");
-		goto err1;
+		ERROR("Error: Please use add or del (Please see --help output)");
+		goto err;
 	}
+
 	exit(EXIT_SUCCESS);
-err1:
-	lxc_container_put(c);
+
 err:
+	lxc_container_put(c);
 	exit(EXIT_FAILURE);
 }

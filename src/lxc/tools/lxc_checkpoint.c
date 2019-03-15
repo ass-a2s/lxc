@@ -16,31 +16,45 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include <lxc/lxccontainer.h>
 
 #include "arguments.h"
-#include "tool_utils.h"
+#include "config.h"
+#include "log.h"
+#include "utils.h"
 
-static char *checkpoint_dir = NULL;
-static bool stop = false;
-static bool verbose = false;
-static bool do_restore = false;
-static bool daemonize_set = false;
-static bool pre_dump = false;
-static char *predump_dir = NULL;
+#define OPT_PREDUMP_DIR (OPT_USAGE + 1)
 
-#define OPT_PREDUMP_DIR OPT_USAGE + 1
+lxc_log_define(lxc_checkpoint, lxc);
+
+static int my_parser(struct lxc_arguments *args, int c, char *arg);
+static int my_checker(const struct lxc_arguments *args);
+static bool checkpoint(struct lxc_container *c);
+static bool restore_finalize(struct lxc_container *c);
+static bool restore(struct lxc_container *c);
+
+static char *checkpoint_dir;
+static bool stop;
+static bool verbose;
+static bool do_restore;
+static bool daemonize_set;
+static bool pre_dump;
+static char *predump_dir;
+static char *actionscript_path;
 
 static const struct option my_longopts[] = {
 	{"checkpoint-dir", required_argument, 0, 'D'},
+	{"action-script", required_argument, 0, 'A'},
 	{"stop", no_argument, 0, 's'},
 	{"verbose", no_argument, 0, 'v'},
 	{"restore", no_argument, 0, 'r'},
@@ -51,29 +65,39 @@ static const struct option my_longopts[] = {
 	LXC_COMMON_OPTIONS
 };
 
-static int my_checker(const struct lxc_arguments *args)
-{
-	if (do_restore && stop) {
-		lxc_error(args, "-s not compatible with -r.");
-		return -1;
-
-	} else if (!do_restore && daemonize_set) {
-		lxc_error(args, "-d/-F not compatible with -r.");
-		return -1;
-	}
-
-	if (checkpoint_dir == NULL) {
-		lxc_error(args, "-D is required.");
-		return -1;
-	}
-
-	if (pre_dump && do_restore) {
-		lxc_error(args, "-p not compatible with -r.");
-		return -1;
-	}
-
-	return 0;
-}
+static struct lxc_arguments my_args = {
+	.progname     = "lxc-checkpoint",
+	.help         = "\
+--name=NAME\n\
+\n\
+lxc-checkpoint checkpoints and restores a container\n\
+  Serializes a container's running state to disk to allow restoring it in\n\
+  its running state at a later time.\n\
+\n\
+Options :\n\
+  -n, --name=NAME           NAME of the container\n\
+  -r, --restore             Restore container\n\
+  -D, --checkpoint-dir=DIR  directory to save the checkpoint in\n\
+  -v, --verbose             Enable verbose criu logs\n\
+  -A, --action-script=PATH  Path to criu action script\n\
+  Checkpoint options:\n\
+  -s, --stop                Stop the container after checkpointing.\n\
+  -p, --pre-dump            Only pre-dump the memory of the container.\n\
+                            Container keeps on running and following\n\
+                            checkpoints will only dump the changes.\n\
+  --predump-dir=DIR         path to images from previous dump (relative to -D)\n\
+  Restore options:\n\
+  -d, --daemon              Daemonize the container (default)\n\
+  -F, --foreground          Start with the current tty attached to /dev/console\n\
+  --rcfile=FILE             Load configuration file FILE\n\
+",
+	.options      = my_longopts,
+	.parser       = my_parser,
+	.daemonize    = 1,
+	.checker      = my_checker,
+	.log_priority = "ERROR",
+	.log_file     = "none",
+};
 
 static int my_parser(struct lxc_arguments *args, int c, char *arg)
 {
@@ -81,6 +105,11 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
 	case 'D':
 		checkpoint_dir = strdup(arg);
 		if (!checkpoint_dir)
+			return -1;
+		break;
+	case 'A':
+		actionscript_path = strdup(arg);
+		if (!actionscript_path)
 			return -1;
 		break;
 	case 's':
@@ -109,39 +138,33 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
 			return -1;
 		break;
 	}
+
 	return 0;
 }
 
-static struct lxc_arguments my_args = {
-	.progname  = "lxc-checkpoint",
-	.help      = "\
---name=NAME\n\
-\n\
-lxc-checkpoint checkpoints and restores a container\n\
-  Serializes a container's running state to disk to allow restoring it in\n\
-  its running state at a later time.\n\
-\n\
-Options :\n\
-  -n, --name=NAME           NAME of the container\n\
-  -r, --restore             Restore container\n\
-  -D, --checkpoint-dir=DIR  directory to save the checkpoint in\n\
-  -v, --verbose             Enable verbose criu logs\n\
-  Checkpoint options:\n\
-  -s, --stop                Stop the container after checkpointing.\n\
-  -p, --pre-dump            Only pre-dump the memory of the container.\n\
-                            Container keeps on running and following\n\
-                            checkpoints will only dump the changes.\n\
-  --predump-dir=DIR         path to images from previous dump (relative to -D)\n\
-  Restore options:\n\
-  -d, --daemon              Daemonize the container (default)\n\
-  -F, --foreground          Start with the current tty attached to /dev/console\n\
-  --rcfile=FILE             Load configuration file FILE\n\
-",
-	.options   = my_longopts,
-	.parser    = my_parser,
-	.daemonize = 1,
-	.checker   = my_checker,
-};
+static int my_checker(const struct lxc_arguments *args)
+{
+	if (do_restore && stop) {
+		ERROR("-s not compatible with -r");
+		return -1;
+
+	} else if (!do_restore && daemonize_set) {
+		ERROR("-d/-F not compatible with -r");
+		return -1;
+	}
+
+	if (!checkpoint_dir) {
+		ERROR("-D is required");
+		return -1;
+	}
+
+	if (pre_dump && do_restore) {
+		ERROR("-p not compatible with -r");
+		return -1;
+	}
+
+	return 0;
+}
 
 static bool checkpoint(struct lxc_container *c)
 {
@@ -150,7 +173,7 @@ static bool checkpoint(struct lxc_container *c)
 	int mode;
 
 	if (!c->is_running(c)) {
-		fprintf(stderr, "%s not running, not checkpointing.\n", my_args.name);
+		ERROR("%s not running, not checkpointing", my_args.name);
 		lxc_container_put(c);
 		return false;
 	}
@@ -161,6 +184,7 @@ static bool checkpoint(struct lxc_container *c)
 	opts.stop = stop;
 	opts.verbose = verbose;
 	opts.predump_dir = predump_dir;
+	opts.action_script = actionscript_path;
 
 	if (pre_dump)
 		mode = MIGRATE_PRE_DUMP;
@@ -173,7 +197,7 @@ static bool checkpoint(struct lxc_container *c)
 	/* the migrate() API does not negate the return code like
 	 * checkpoint() and restore() does. */
 	if (ret) {
-		fprintf(stderr, "Checkpointing %s failed.\n", my_args.name);
+		ERROR("Checkpointing %s failed", my_args.name);
 		return false;
 	}
 
@@ -182,19 +206,30 @@ static bool checkpoint(struct lxc_container *c)
 
 static bool restore_finalize(struct lxc_container *c)
 {
-	bool ret = c->restore(c, checkpoint_dir, verbose);
-	if (!ret) {
-		fprintf(stderr, "Restoring %s failed.\n", my_args.name);
+	struct migrate_opts opts;
+	bool ret;
+
+	memset(&opts, 0, sizeof(opts));
+
+	opts.directory = checkpoint_dir;
+	opts.verbose = verbose;
+	opts.stop = stop;
+	opts.action_script = actionscript_path;
+
+	ret = c->migrate(c, MIGRATE_RESTORE, &opts, sizeof(opts));
+	if (ret) {
+		ERROR("Restoring %s failed", my_args.name);
+		return false;
 	}
 
 	lxc_container_put(c);
-	return ret;
+	return true;
 }
 
 static bool restore(struct lxc_container *c)
 {
 	if (c->is_running(c)) {
-		fprintf(stderr, "%s is running, not restoring.\n", my_args.name);
+		ERROR("%s is running, not restoring", my_args.name);
 		lxc_container_put(c);
 		return false;
 	}
@@ -204,7 +239,7 @@ static bool restore(struct lxc_container *c)
 
 		pid = fork();
 		if (pid < 0) {
-			perror("fork");
+			SYSERROR("Failed to fork");
 			return false;
 		}
 
@@ -212,7 +247,7 @@ static bool restore(struct lxc_container *c)
 			close(0);
 			close(1);
 
-			exit(!restore_finalize(c));
+			_exit(!restore_finalize(c));
 		} else {
 			return wait_for_pid(pid) == 0;
 		}
@@ -238,9 +273,6 @@ int main(int argc, char *argv[])
 	if (lxc_arguments_parse(&my_args, argc, argv))
 		exit(EXIT_FAILURE);
 
-	if (!my_args.log_file)
-		my_args.log_file = "none";
-
 	log.name = my_args.name;
 	log.file = my_args.log_file;
 	log.level = my_args.log_priority;
@@ -253,33 +285,35 @@ int main(int argc, char *argv[])
 
 	c = lxc_container_new(my_args.name, my_args.lxcpath[0]);
 	if (!c) {
-		fprintf(stderr, "System error loading %s\n", my_args.name);
+		ERROR("System error loading %s", my_args.name);
 		exit(EXIT_FAILURE);
 	}
 
 	if (my_args.rcfile) {
 		c->clear_config(c);
+
 		if (!c->load_config(c, my_args.rcfile)) {
-			fprintf(stderr, "Failed to load rcfile\n");
+			ERROR("Failed to load rcfile");
 			lxc_container_put(c);
 			exit(EXIT_FAILURE);
 		}
+
 		c->configfile = strdup(my_args.rcfile);
 		if (!c->configfile) {
-			fprintf(stderr, "Out of memory setting new config filename\n");
+			ERROR("Out of memory setting new config filename");
 			lxc_container_put(c);
 			exit(EXIT_FAILURE);
 		}
 	}
 
 	if (!c->may_control(c)) {
-		fprintf(stderr, "Insufficent privileges to control %s\n", my_args.name);
+		ERROR("Insufficent privileges to control %s", my_args.name);
 		lxc_container_put(c);
 		exit(EXIT_FAILURE);
 	}
 
 	if (!c->is_defined(c)) {
-		fprintf(stderr, "%s is not defined\n", my_args.name);
+		ERROR("%s is not defined", my_args.name);
 		lxc_container_put(c);
 		exit(EXIT_FAILURE);
 	}
@@ -289,6 +323,10 @@ int main(int argc, char *argv[])
 		ret = restore(c);
 	else
 		ret = checkpoint(c);
+
+	free(actionscript_path);
+	free(checkpoint_dir);
+	free(predump_dir);
 
 	if (!ret)
 		exit(EXIT_FAILURE);

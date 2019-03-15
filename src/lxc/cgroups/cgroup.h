@@ -28,6 +28,10 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#define PAYLOAD_CGROUP "lxc.payload"
+#define MONITOR_CGROUP "lxc.monitor"
+#define PIVOT_CGROUP "lxc.pivot"
+
 struct lxc_handler;
 struct lxc_conf;
 struct lxc_list;
@@ -39,50 +43,131 @@ typedef enum {
         CGROUP_LAYOUT_UNIFIED =  2,
 } cgroup_layout_t;
 
-struct cgroup_ops {
-	const char *driver;
-	const char *version;
-
-	void *(*init)(struct lxc_handler *handler);
-	void (*destroy)(void *hdata, struct lxc_conf *conf);
-	bool (*create)(void *hdata);
-	bool (*enter)(void *hdata, pid_t pid);
-	bool (*create_legacy)(void *hdata, pid_t pid);
-	const char *(*get_cgroup)(void *hdata, const char *subsystem);
-	bool (*escape)();
-	int (*num_hierarchies)();
-	bool (*get_hierarchies)(int n, char ***out);
-	int (*set)(const char *filename, const char *value, const char *name, const char *lxcpath);
-	int (*get)(const char *filename, char *value, size_t len, const char *name, const char *lxcpath);
-	bool (*unfreeze)(void *hdata);
-	bool (*setup_limits)(void *hdata, struct lxc_conf *conf, bool with_devices);
-	bool (*chown)(void *hdata, struct lxc_conf *conf);
-	bool (*attach)(const char *name, const char *lxcpath, pid_t pid);
-	bool (*mount_cgroup)(void *hdata, const char *root, int type);
-	int (*nrtasks)(void *hdata);
-	void (*disconnect)(void);
+/* A descriptor for a mounted hierarchy
+ *
+ * @controllers
+ * - legacy hierarchy
+ *   Either NULL, or a null-terminated list of all the co-mounted controllers.
+ * - unified hierarchy
+ *   Either NULL, or a null-terminated list of all enabled controllers.
+ *
+ * @mountpoint
+ * - The mountpoint we will use.
+ * - legacy hierarchy
+ *   It will be either /sys/fs/cgroup/controller or
+ *   /sys/fs/cgroup/controllerlist.
+ * - unified hierarchy
+ *   It will either be /sys/fs/cgroup or /sys/fs/cgroup/<mountpoint-name>
+ *   depending on whether this is a hybrid cgroup layout (mix of legacy and
+ *   unified hierarchies) or a pure unified cgroup layout.
+ *
+ * @container_base_path
+ * - The cgroup under which the container cgroup path
+ *   is created. This will be either the caller's cgroup (if not root), or
+ *   init's cgroup (if root).
+ *
+ * @container_full_path
+ * - The full path to the containers cgroup.
+ *
+ * @monitor_full_path
+ * - The full path to the monitor's cgroup.
+ *
+ * @version
+ * - legacy hierarchy
+ *   If the hierarchy is a legacy hierarchy this will be set to
+ *   CGROUP_SUPER_MAGIC.
+ * - unified hierarchy
+ *   If the hierarchy is a legacy hierarchy this will be set to
+ *   CGROUP2_SUPER_MAGIC.
+ */
+struct hierarchy {
+	/*
+	 * cgroup2 only: what files need to be chowned to delegate a cgroup to
+	 * an unprivileged user.
+	 */
+	char **cgroup2_chown;
+	char **controllers;
+	char *mountpoint;
+	char *container_base_path;
+	char *container_full_path;
+	char *monitor_full_path;
+	int version;
 };
 
-extern bool cgroup_attach(const char *name, const char *lxcpath, pid_t pid);
-extern bool cgroup_mount(const char *root, struct lxc_handler *handler, int type);
-extern void cgroup_destroy(struct lxc_handler *handler);
-extern bool cgroup_init(struct lxc_handler *handler);
-extern bool cgroup_create(struct lxc_handler *handler);
-extern bool cgroup_setup_limits(struct lxc_handler *handler, bool with_devices);
-extern bool cgroup_chown(struct lxc_handler *handler);
-extern bool cgroup_enter(struct lxc_handler *handler);
-extern void cgroup_cleanup(struct lxc_handler *handler);
-extern bool cgroup_create_legacy(struct lxc_handler *handler);
-extern int cgroup_nrtasks(struct lxc_handler *handler);
-extern const char *cgroup_get_cgroup(struct lxc_handler *handler,
-				     const char *subsystem);
-extern bool cgroup_escape();
-extern int cgroup_num_hierarchies();
-extern bool cgroup_get_hierarchies(int i, char ***out);
-extern bool cgroup_unfreeze(struct lxc_handler *handler);
-extern void cgroup_disconnect(void);
+struct cgroup_ops {
+	/* string constant */
+	const char *driver;
+
+	/* string constant */
+	const char *version;
+
+	/* What controllers is the container supposed to use. */
+	char **cgroup_use;
+	char *cgroup_pattern;
+	char *container_cgroup;
+
+	/* Static memory, do not free.*/
+	const char *monitor_pattern;
+
+	/* @hierarchies
+	 * - A NULL-terminated array of struct hierarchy, one per legacy
+	 *   hierarchy. No duplicates. First sufficient, writeable mounted
+	 *   hierarchy wins.
+	 */
+	struct hierarchy **hierarchies;
+	/* Pointer to the unified hierarchy. Do not free! */
+	struct hierarchy *unified;
+
+	/*
+	 * @cgroup_layout
+	 * - What cgroup layout the container is running with.
+	 *   - CGROUP_LAYOUT_UNKNOWN
+	 *     The cgroup layout could not be determined. This should be treated
+	 *     as an error condition.
+	 *   - CGROUP_LAYOUT_LEGACY
+	 *     The container is running with all controllers mounted into legacy
+	 *     cgroup hierarchies.
+	 *   - CGROUP_LAYOUT_HYBRID
+	 *     The container is running with at least one controller mounted
+	 *     into a legacy cgroup hierarchy and a mountpoint for the unified
+	 *     hierarchy. The unified hierarchy can be empty (no controllers
+	 *     enabled) or non-empty (controllers enabled).
+	 *   - CGROUP_LAYOUT_UNIFIED
+	 *     The container is running on a pure unified cgroup hierarchy. The
+	 *     unified hierarchy can be empty (no controllers enabled) or
+	 *     non-empty (controllers enabled).
+	 */
+	cgroup_layout_t cgroup_layout;
+
+	bool (*data_init)(struct cgroup_ops *ops);
+	void (*payload_destroy)(struct cgroup_ops *ops, struct lxc_handler *handler);
+	void (*monitor_destroy)(struct cgroup_ops *ops, struct lxc_handler *handler);
+	bool (*monitor_create)(struct cgroup_ops *ops, struct lxc_handler *handler);
+	bool (*monitor_enter)(struct cgroup_ops *ops, pid_t pid);
+	bool (*payload_create)(struct cgroup_ops *ops, struct lxc_handler *handler);
+	bool (*payload_enter)(struct cgroup_ops *ops, pid_t pid);
+	const char *(*get_cgroup)(struct cgroup_ops *ops, const char *controller);
+	bool (*escape)(const struct cgroup_ops *ops, struct lxc_conf *conf);
+	int (*num_hierarchies)(struct cgroup_ops *ops);
+	bool (*get_hierarchies)(struct cgroup_ops *ops, int n, char ***out);
+	int (*set)(struct cgroup_ops *ops, const char *filename,
+		   const char *value, const char *name, const char *lxcpath);
+	int (*get)(struct cgroup_ops *ops, const char *filename, char *value,
+		   size_t len, const char *name, const char *lxcpath);
+	bool (*unfreeze)(struct cgroup_ops *ops);
+	bool (*setup_limits)(struct cgroup_ops *ops, struct lxc_conf *conf,
+			     bool with_devices);
+	bool (*chown)(struct cgroup_ops *ops, struct lxc_conf *conf);
+	bool (*attach)(struct cgroup_ops *ops, const char *name,
+		       const char *lxcpath, pid_t pid);
+	bool (*mount)(struct cgroup_ops *ops, struct lxc_handler *handler,
+		      const char *root, int type);
+	int (*nrtasks)(struct cgroup_ops *ops);
+};
+
+extern struct cgroup_ops *cgroup_init(struct lxc_conf *conf);
+extern void cgroup_exit(struct cgroup_ops *ops);
 
 extern void prune_init_scope(char *cg);
-extern bool is_crucial_cgroup_subsystem(const char *s);
 
 #endif

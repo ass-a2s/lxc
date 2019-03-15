@@ -21,17 +21,21 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <errno.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <sys/mount.h>
 #include <sys/param.h>
+#include <unistd.h>
 
 #include "conf.h"
+#include "config.h"
 #include "log.h"
 #include "lsm.h"
 
-lxc_log_define(lxc_lsm, lxc);
+lxc_log_define(lsm, lxc);
 
 static struct lsm_drv *drv = NULL;
 
@@ -111,8 +115,7 @@ int lsm_process_label_fd_get(pid_t pid, bool on_exec)
 
 	labelfd = open(path, O_RDWR);
 	if (labelfd < 0) {
-		SYSERROR("%s - Unable to %s LSM label file descriptor",
-			 name, strerror(errno));
+		SYSERROR("Unable to %s LSM label file descriptor", name);
 		return -1;
 	}
 
@@ -142,18 +145,20 @@ int lsm_process_label_set_at(int label_fd, const char *label, bool on_exec)
 
 		if (on_exec) {
 			ERROR("Changing AppArmor profile on exec not supported");
-			return -EINVAL;
+			return -1;
 		}
 
 		len = strlen(label) + strlen("changeprofile ") + 1;
 		command = malloc(len);
 		if (!command)
-			return -1;
+			goto on_error;
 
 		ret = snprintf(command, len, "changeprofile %s", label);
 		if (ret < 0 || (size_t)ret >= len) {
+			int saved_errno = errno;
 			free(command);
-			return -1;
+			errno = saved_errno;
+			goto on_error;
 		}
 
 		ret = lxc_write_nointr(label_fd, command, len - 1);
@@ -161,9 +166,11 @@ int lsm_process_label_set_at(int label_fd, const char *label, bool on_exec)
 	} else if (strcmp(name, "SELinux") == 0) {
 		ret = lxc_write_nointr(label_fd, label, strlen(label));
 	} else {
-		ret = -EINVAL;
+		errno = EINVAL;
+		ret = -1;
 	}
 	if (ret < 0) {
+on_error:
 		SYSERROR("Failed to set %s label \"%s\"", name, label);
 		return -1;
 	}
@@ -173,11 +180,37 @@ int lsm_process_label_set_at(int label_fd, const char *label, bool on_exec)
 }
 
 int lsm_process_label_set(const char *label, struct lxc_conf *conf,
-			  bool use_default, bool on_exec)
+			  bool on_exec)
 {
 	if (!drv) {
 		ERROR("LSM driver not inited");
 		return -1;
 	}
-	return drv->process_label_set(label, conf, use_default, on_exec);
+	return drv->process_label_set(label, conf, on_exec);
+}
+
+int lsm_process_prepare(struct lxc_conf *conf, const char *lxcpath)
+{
+	if (!drv) {
+		ERROR("LSM driver not inited");
+		return 0;
+	}
+
+	if (!drv->prepare)
+		return 0;
+
+	return drv->prepare(conf, lxcpath);
+}
+
+void lsm_process_cleanup(struct lxc_conf *conf, const char *lxcpath)
+{
+	if (!drv) {
+		ERROR("LSM driver not inited");
+		return;
+	}
+
+	if (!drv->cleanup)
+		return;
+
+	drv->cleanup(conf, lxcpath);
 }

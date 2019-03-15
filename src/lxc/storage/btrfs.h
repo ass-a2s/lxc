@@ -24,11 +24,10 @@
 #ifndef __LXC_BTRFS_H
 #define __LXC_BTRFS_H
 
-#define _GNU_SOURCE
+#include <byteswap.h>
 #include <linux/types.h> /* __le64, __l32 ... */
 #include <stdbool.h>
 #include <stdint.h>
-#include <byteswap.h>
 
 #ifndef BTRFS_SUPER_MAGIC
 #  define BTRFS_SUPER_MAGIC       0x9123683E
@@ -396,7 +395,7 @@ extern int btrfs_mount(struct lxc_storage *bdev);
 extern int btrfs_umount(struct lxc_storage *bdev);
 
 extern char *get_btrfs_subvol_path(int fd, u64 dir_id, u64 objid, char *name,
-				   int name_len);
+				   u16 name_len);
 extern int btrfs_list_get_path_rootid(int fd, u64 *treeid);
 extern bool is_btrfs_fs(const char *path);
 extern int is_btrfs_subvol(const char *path);

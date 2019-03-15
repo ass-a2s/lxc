@@ -21,20 +21,24 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <grp.h>
 #include <sched.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
 #include <sys/mount.h>
+#include <sys/types.h>
+#include <unistd.h>
 
+#include "config.h"
 #include "log.h"
 #include "rsync.h"
 #include "storage.h"
+#include "syscall_wrappers.h"
 #include "utils.h"
 
 lxc_log_define(rsync, lxc);
@@ -47,15 +51,12 @@ int lxc_storage_rsync_exec_wrapper(void *data)
 
 int lxc_rsync_exec_wrapper(void *data)
 {
-	int ret;
 	struct rsync_data_char *args = data;
 
-	ret = lxc_switch_uid_gid(0, 0);
-	if (ret < 0)
+	if (!lxc_switch_uid_gid(0, 0))
 		return -1;
 
-	ret = lxc_setgroups(0, NULL);
-	if (ret < 0)
+	if (!lxc_setgroups(0, NULL))
 		return -1;
 
 	return lxc_rsync_exec(args->src, args->dest);
@@ -73,8 +74,10 @@ int lxc_rsync_exec(const char *src, const char *dest)
 		return -1;
 
 	ret = snprintf(s, l, "%s", src);
-	if (ret < 0 || (size_t)ret >= l)
+	if (ret < 0 || (size_t)ret >= l) {
+		free(s);
 		return -1;
+	}
 
 	s[l - 2] = '/';
 	s[l - 1] = '\0';
@@ -115,12 +118,10 @@ int lxc_rsync(struct rsync_data *data)
 		return -1;
 	}
 
-	ret = lxc_switch_uid_gid(0, 0);
-	if (ret < 0)
+	if (!lxc_switch_uid_gid(0, 0))
 		return -1;
 
-	ret = lxc_setgroups(0, NULL);
-	if (ret < 0)
+	if (!lxc_setgroups(0, NULL))
 		return -1;
 
 	src = lxc_storage_get_path(orig->dest, orig->type);

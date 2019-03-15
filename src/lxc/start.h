@@ -32,7 +32,6 @@
 #include <sys/un.h>
 
 #include "conf.h"
-#include "config.h"
 #include "namespace.h"
 #include "state.h"
 
@@ -98,10 +97,13 @@ struct lxc_handler {
 	bool am_root;
 
 	/* Indicates whether should we close std{in,out,err} on start. */
-	bool backgrounded;
+	bool daemonize;
 
 	/* The child's pid. */
 	pid_t pid;
+
+	/* The monitor's pid. */
+	pid_t monitor_pid;
 
 	/* Whether the child has already exited. */
 	bool init_died;
@@ -132,6 +134,15 @@ struct lxc_handler {
 	 * true.
 	 */
 	int exit_status;
+
+	struct cgroup_ops *cgroup_ops;
+};
+
+struct execute_args {
+	char *init_path;
+	int init_fd;
+	char *const *argv;
+	int quiet;
 };
 
 struct lxc_operations {

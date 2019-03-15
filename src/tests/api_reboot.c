@@ -119,7 +119,9 @@ on_error_stop:
 
 on_error_put:
 	lxc_container_put(c);
+
 	if (ret == EXIT_SUCCESS)
 		lxc_debug("%s\n", "All reboot tests passed");
+
 	exit(ret);
 }

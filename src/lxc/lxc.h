@@ -31,6 +31,7 @@ extern "C" {
 #include <stddef.h>
 #include <sys/select.h>
 #include <sys/types.h>
+
 #include "state.h"
 
 struct lxc_msg;
@@ -47,27 +48,27 @@ struct lxc_handler;
 /*
  * Start the specified command inside a system container
  * @name         : the name of the container
- * @argv         : an array of char * corresponding to the commande line
+ * @argv         : an array of char * corresponding to the command line
  * @conf         : configuration
- * @backgrounded : whether or not the container is daemonized
+ * @daemonize    : whether or not the container is daemonized
  * Returns 0 on success, < 0 otherwise
  */
 extern int lxc_start(const char *name, char *const argv[],
 		     struct lxc_handler *handler, const char *lxcpath,
-		     bool backgrounded, int *error_num);
+		     bool daemonize, int *error_num);
 
 /*
  * Start the specified command inside an application container
  * @name         : the name of the container
- * @argv         : an array of char * corresponding to the commande line
+ * @argv         : an array of char * corresponding to the command line
  * @quiet        : if != 0 then lxc-init won't produce any output
  * @conf         : configuration
- * @backgrounded : whether or not the container is daemonized
+ * @daemonize    : whether or not the container is daemonized
  * Returns 0 on success, < 0 otherwise
  */
 extern int lxc_execute(const char *name, char *const argv[], int quiet,
 		       struct lxc_handler *handler, const char *lxcpath,
-		       bool backgrounded, int *error_num);
+		       bool daemonize, int *error_num);
 
 /*
  * Close the fd associated with the monitoring
@@ -81,14 +82,16 @@ extern int lxc_monitor_close(int fd);
  * @name : the container name
  * Returns 0 on success, < 0 otherwise
  */
-extern int lxc_freeze(const char *name, const char *lxcpath);
+extern int lxc_freeze(struct lxc_conf *conf, const char *name,
+		      const char *lxcpath);
 
 /*
  * Unfreeze all previously frozen tasks.
  * @name : the name of the container
  * Return 0 on success, < 0 otherwise
  */
-extern int lxc_unfreeze(const char *name, const char *lxcpath);
+extern int lxc_unfreeze(struct lxc_conf *conf, const char *name,
+			const char *lxcpath);
 
 /*
  * Retrieve the container state
@@ -96,29 +99,6 @@ extern int lxc_unfreeze(const char *name, const char *lxcpath);
  * Returns the state of the container on success, < 0 otherwise
  */
 extern lxc_state_t lxc_state(const char *name, const char *lxcpath);
-
-/*
- * Set a specified value for a specified subsystem. The specified
- * subsystem must be fully specified, eg. "cpu.shares"
- * @filename  : the cgroup attribute filename
- * @value     : the value to be set
- * @name      : the name of the container
- * @lxcpath   : lxc config path for container
- * Returns 0 on success, < 0 otherwise
- */
-extern int lxc_cgroup_set(const char *filename, const char *value, const char *name, const char *lxcpath);
-
-/*
- * Get a specified value for a specified subsystem. The specified
- * subsystem must be fully specified, eg. "cpu.shares"
- * @filename  : the cgroup attribute filename
- * @value     : the value to be set
- * @len       : the len of the value variable
- * @name      : the name of the container
- * @lxcpath   : lxc config path for container
- * Returns the number of bytes read, < 0 on error
- */
-extern int lxc_cgroup_get(const char *filename, char *value, size_t len, const char *name, const char *lxcpath);
 
 /*
  * Create and return a new lxccontainer struct.

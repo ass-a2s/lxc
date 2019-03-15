@@ -61,6 +61,7 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
       <arg choice="opt">-p, --newpath <replaceable>newpath</replaceable></arg>
       <arg choice="opt">-B, --backingstorage <replaceable>backingstorage</replaceable></arg>
       <arg choice="opt">-s, --snapshot</arg>
+      <arg choice="opt">-a, --allowrunning</arg>
       <arg choice="opt">-K, --keepname</arg>
       <arg choice="opt">-D, --keepdata</arg>
       <arg choice="opt">-M, --keepmac</arg>
@@ -91,6 +92,7 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
       <arg choice="req">-e, --ephemeral</arg>
       <arg choice="opt">-B, --backingstorage <replaceable>backingstorage</replaceable></arg>
       <arg choice="opt">-s, --snapshot</arg>
+      <arg choice="opt">-a, --allowrunning</arg>
       <arg choice="opt">-t, --tmpfs</arg>
       <arg choice="opt">-K, --keepname</arg>
       <arg choice="opt">-M, --keepmac</arg>
@@ -249,6 +251,19 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
 	  </varlistentry>
 
 	  <varlistentry>
+	    <term> <option>-a,--allowrunning </option> </term>
+	   <listitem>
+	    <para><!-- Allow the creation of a Snapshot of an already running container.
+	    This may cause data corruption or data loss depending on the used
+	    filesystem and applications. Use with care. -->
+	      実行中のコンテナのスナップショットを作成します。
+	      これは、使用しているファイルシステムやアプリケーションによっては、データの破損や欠損を引き起こす可能性があります。
+	      注意して使用してください。
+	    </para>
+	   </listitem>
+	  </varlistentry>
+
+	  <varlistentry>
 	    <term> <option>-F,--foreground</option> </term>
 	   <listitem>
             <para><!-- Run the snapshot in the foreground. The snapshots console will
@@ -308,7 +323,7 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
             <para><!-- Specify the backing storage type to be used for the copy
             where 'backingstorage' is of type 'btrfs', 'dir', 'lvm', 'loop',
             'overlay', or 'zfs'. -->
-	      コピー先コンテナのバッキングストレージのタイプを指定します。ここで 'backingsotrage' は 'btrfs'、'dir'、'lvm'、'loop'、'overlay'、'zfs' のどれかです。
+	      コピー先コンテナのバッキングストレージのタイプを指定します。ここで 'backingstorage' は 'btrfs'、'dir'、'lvm'、'loop'、'overlay'、'zfs' のどれかです。
 	    </para>
 	   </listitem>
 	  </varlistentry>

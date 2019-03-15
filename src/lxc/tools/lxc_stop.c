@@ -21,7 +21,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <libgen.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,10 +33,50 @@
 #include <lxc/lxccontainer.h>
 
 #include "arguments.h"
-#include "tool_utils.h"
+#include "config.h"
+#include "log.h"
+#include "utils.h"
 
-#define OPT_NO_LOCK OPT_USAGE + 1
-#define OPT_NO_KILL OPT_USAGE + 2
+#define OPT_NO_LOCK (OPT_USAGE + 1)
+#define OPT_NO_KILL (OPT_USAGE + 2)
+
+lxc_log_define(lxc_stop, lxc);
+
+static int my_parser(struct lxc_arguments *args, int c, char *arg);
+
+static const struct option my_longopts[] = {
+	{"reboot", no_argument, 0, 'r'},
+	{"nowait", no_argument, 0, 'W'},
+	{"timeout", required_argument, 0, 't'},
+	{"kill", no_argument, 0, 'k'},
+	{"nokill", no_argument, 0, OPT_NO_KILL},
+	{"nolock", no_argument, 0, OPT_NO_LOCK},
+	LXC_COMMON_OPTIONS
+};
+
+static struct lxc_arguments my_args = {
+	.progname     = "lxc-stop",
+	.help         = "\
+--name=NAME\n\
+\n\
+lxc-stop stops a container with the identifier NAME\n\
+\n\
+Options :\n\
+  -n, --name=NAME   NAME of the container\n\
+  -r, --reboot      reboot the container\n\
+  -W, --nowait      don't wait for shutdown or reboot to complete\n\
+  -t, --timeout=T   wait T seconds before hard-stopping\n\
+  -k, --kill        kill container rather than request clean shutdown\n\
+      --nolock      Avoid using API locks\n\
+      --nokill      Only request clean shutdown, don't force kill after timeout\n\
+  --rcfile=FILE     Load configuration file FILE\n",
+	.options      = my_longopts,
+	.parser       = my_parser,
+	.checker      = NULL,
+	.log_priority = "ERROR",
+	.log_file     = "none",
+	.timeout      = -2,
+};
 
 static int my_parser(struct lxc_arguments *args, int c, char *arg)
 {
@@ -61,38 +103,6 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
 	}
 	return 0;
 }
-
-static const struct option my_longopts[] = {
-	{"reboot", no_argument, 0, 'r'},
-	{"nowait", no_argument, 0, 'W'},
-	{"timeout", required_argument, 0, 't'},
-	{"kill", no_argument, 0, 'k'},
-	{"nokill", no_argument, 0, OPT_NO_KILL},
-	{"nolock", no_argument, 0, OPT_NO_LOCK},
-	LXC_COMMON_OPTIONS
-};
-
-static struct lxc_arguments my_args = {
-	.progname = "lxc-stop",
-	.help     = "\
---name=NAME\n\
-\n\
-lxc-stop stops a container with the identifier NAME\n\
-\n\
-Options :\n\
-  -n, --name=NAME   NAME of the container\n\
-  -r, --reboot      reboot the container\n\
-  -W, --nowait      don't wait for shutdown or reboot to complete\n\
-  -t, --timeout=T   wait T seconds before hard-stopping\n\
-  -k, --kill        kill container rather than request clean shutdown\n\
-      --nolock      Avoid using API locks\n\
-      --nokill      Only request clean shutdown, don't force kill after timeout\n\
-  --rcfile=FILE     Load configuration file FILE\n",
-	.options  = my_longopts,
-	.parser   = my_parser,
-	.checker  = NULL,
-	.timeout  = -2,
-};
 
 int main(int argc, char *argv[])
 {
@@ -127,56 +137,59 @@ int main(int argc, char *argv[])
 
 	/* some checks */
 	if (!my_args.hardstop && my_args.timeout < -1) {
-		fprintf(stderr, "invalid timeout\n");
+		ERROR("Invalid timeout");
 		exit(ret);
 	}
 
 	if (my_args.hardstop && my_args.nokill) {
-		fprintf(stderr, "-k can't be used with --nokill\n");
+		ERROR("-k can't be used with --nokill");
 		exit(ret);
 	}
 
 	if (my_args.hardstop && my_args.reboot) {
-		fprintf(stderr, "-k can't be used with -r\n");
+		ERROR("-k can't be used with -r");
 		exit(ret);
 	}
 
 	if (my_args.hardstop && my_args.timeout) {
-		fprintf(stderr, "-k doesn't allow timeouts\n");
+		ERROR("-k doesn't allow timeouts");
 		exit(ret);
 	}
 
 	if (my_args.nolock && !my_args.hardstop) {
-		fprintf(stderr, "--nolock may only be used with -k\n");
+		ERROR("--nolock may only be used with -k");
 		exit(ret);
 	}
 
 	c = lxc_container_new(my_args.name, my_args.lxcpath[0]);
 	if (!c) {
-		fprintf(stderr, "Error opening container\n");
+		ERROR("Error opening container");
 		goto out;
 	}
 
 	if (my_args.rcfile) {
 		c->clear_config(c);
+
 		if (!c->load_config(c, my_args.rcfile)) {
-			fprintf(stderr, "Failed to load rcfile\n");
+			ERROR("Failed to load rcfile");
 			goto out;
 		}
+
 		c->configfile = strdup(my_args.rcfile);
 		if (!c->configfile) {
-			fprintf(stderr, "Out of memory setting new config filename\n");
+			ERROR("Out of memory setting new config filename");
 			goto out;
 		}
 	}
 
 	if (!c->may_control(c)) {
-		fprintf(stderr, "Insufficent privileges to control %s\n", c->name);
+		ERROR("Insufficent privileges to control %s", c->name);
 		goto out;
 	}
 
 	if (!c->is_running(c)) {
-		fprintf(stderr, "%s is not running\n", c->name);
+		ERROR("%s is not running", c->name);
+
 		/* Per our manpage we need to exit with exit code:
 		 * 2: The specified container exists but was not running.
 		 */
@@ -192,11 +205,11 @@ int main(int argc, char *argv[])
 
 	/* reboot */
 	if (my_args.reboot) {
-		ret = c->reboot2(c, my_args.timeout);
-		if (ret < 0)
+		if (!c->reboot2(c, my_args.timeout))
 			ret = EXIT_FAILURE;
 		else
 			ret = EXIT_SUCCESS;
+
 		goto out;
 	}
 

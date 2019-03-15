@@ -23,6 +23,8 @@
 LXC_MAPPED_UID=
 LXC_MAPPED_GID=
 
+BUSYBOX_EXE=
+
 # Make sure the usual locations are in PATH
 export PATH=$PATH:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -67,6 +69,7 @@ ${rootfs}/sys \
 ${rootfs}/mnt \
 ${rootfs}/tmp \
 ${rootfs}/var/log \
+${rootfs}/var/run \
 ${rootfs}/usr/share/udhcpc \
 ${rootfs}/dev/pts \
 ${rootfs}/dev/shm \
@@ -128,7 +131,13 @@ EOF
   # writable and readable for other
   chmod 644 "${rootfs}/etc/inittab" || return 1
 
-  cat <<EOF >> "${rootfs}/usr/share/udhcpc/default.script"
+  # Look for the pathname of "default.script" from the help of udhcpc
+  DEF_SCRIPT=`${BUSYBOX_EXE} udhcpc -h 2>&1 | grep -- '-s,--script PROG' | cut -d'/' -f2- | cut -d')' -f1`
+  DEF_SCRIPT_DIR=`dirname /${DEF_SCRIPT}`
+  mkdir -p ${rootfs}/${DEF_SCRIPT_DIR}
+  chmod 644 ${rootfs}/${DEF_SCRIPT_DIR} || return 1
+
+  cat <<EOF >> ${rootfs}/${DEF_SCRIPT}
 #!/bin/sh
 case "\$1" in
   deconfig)
@@ -155,14 +164,17 @@ case "\$1" in
 
     [ -n "\$domain" ] && echo search \$domain > /etc/resolv.conf
     for i in \$dns ; do
-      echo nameserver \$i >> /etc/resolv.conf
+      grep "nameserver \$i" /etc/resolv.conf > /dev/null 2>&1
+      if [ \$? -ne 0 ]; then
+        echo nameserver \$i >> /etc/resolv.conf
+      fi
     done
     ;;
 esac
 exit 0
 EOF
 
- chmod 744 "${rootfs}/usr/share/udhcpc/default.script"
+ chmod 744 ${rootfs}/${DEF_SCRIPT}
 
  return "${res}"
 }
@@ -171,13 +183,8 @@ configure_busybox()
 {
   rootfs="${1}"
 
-  if ! which busybox > /dev/null 2>&1; then
-    echo "ERROR: Failed to find busybox binary"
-    return 1
-  fi
-
   # copy busybox in the rootfs
-  if ! cp "$(which busybox)" "${rootfs}/bin"; then
+  if ! cp "${BUSYBOX_EXE}" "${rootfs}/bin"; then
     echo "ERROR: Failed to copy busybox binary"
     return 1
   fi
@@ -187,9 +194,7 @@ configure_busybox()
   # but that only works right in a chroot with busybox >= 1.19.0
   (
     cd "${rootfs}/bin" || return 1
-    ./busybox --help | grep 'Currently defined functions:' -A300 | \
-      grep -v 'Currently defined functions:' | tr , '\n' | \
-      xargs -n1 ln -s busybox
+    ./busybox --list | grep -v busybox | xargs -n1 ln -s busybox
   )
 
   # relink /sbin/init
@@ -232,7 +237,7 @@ EOF
     usr/lib \
     lib64 \
     usr/lib64"
-  
+
   for dir in ${libdirs}; do
     if [ -d "/${dir}" ] && [ -d "${rootfs}/${dir}" ]; then
       echo "lxc.mount.entry = /${dir} ${dir} none ro,bind 0 0" >> "${path}/config"
@@ -282,7 +287,7 @@ eval set -- "$options"
 while true
 do
   case "$1" in
-    -h|--help)    usage exit 1;;
+    -h|--help)    usage && exit 1;;
     -n|--name)    name=$2; shift 2;;
     -p|--path)    path=$2; shift 2;;
     --rootfs)     rootfs=$2; shift 2;;
@@ -296,6 +301,13 @@ done
 # Check that we have all variables we need
 if [ -z "${name}" ] || [ -z "${path}" ] || [ -z "${rootfs}" ]; then
     echo "ERROR: Please pass the name, path, and rootfs for the container" 1>&2
+    exit 1
+fi
+
+# Make sure busybox is present
+BUSYBOX_EXE=`which busybox`
+if [ $? -ne 0 ]; then
+    echo "ERROR: Failed to find busybox binary"
     exit 1
 fi
 

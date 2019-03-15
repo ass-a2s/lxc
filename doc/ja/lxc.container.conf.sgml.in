@@ -566,11 +566,14 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
               network devices are usable in the container.  It also
               means that if both the container and host have upstart as
               init, 'halt' in a container (for instance) will shut down the
-              host.
+              host. Note that unprivileged containers do not work with this
+              setting due to an inability to mount sysfs. An unsafe workaround
+              would be to bind mount the host's sysfs.
               -->
               <option>none:</option> ホストのネットワーク名前空間を共有します。
               これにより、ホストのネットワークデバイスをコンテナ内で使うことが可能になります。
               もしコンテナもホストも init として upstart を使っている場合、(例えば) コンテナ内で 'halt' を実行すると、ホストがシャットダウンしてしまうことにもなります。
+              非特権コンテナでは、sysfs をマウントできないので、この設定は動作しません。この問題に対する回避策は、ホストの sysfs を bind マウントすることです。ただしこの回避策は安全ではありません。
             </para>
 
             <para>
@@ -1065,23 +1068,25 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
             ringbuffer. Note that ringbuffer must be at least as big as a
             standard page size. When passed a value smaller than a single page
             size liblxc will allocate a ringbuffer of a single page size. A page
-            size is usually 4kB.
+            size is usually 4KB.
                 -->
-              このオプションを設定すると、liblxc はインメモリのリングバッファを割り当てます。コンテナのコンソールはリングバッファに出力されます。リングバッファは少なくとも標準ページサイズの大きさでなければなりません。ページサイズより小さい値を与えた場合は、liblxc  はページサイズのリングバッファを割り当てます。ページサイズは通常は 4kB です。
+              このオプションを設定すると、liblxc はインメモリのリングバッファを割り当てます。コンテナのコンソールはリングバッファに出力されます。リングバッファは少なくとも標準ページサイズの大きさでなければなりません。ページサイズより小さい値を与えた場合は、liblxc  はページサイズのリングバッファを割り当てます。ページサイズは通常は 4KB です。
 
               <!--
             The keyword 'auto' will cause liblxc to allocate a ringbuffer of
-            128kB.
+            128KB.
                 -->
-              'auto' を指定すると、liblxc は 128kB のリングバッファを割り当てます。
+              'auto' を指定すると、liblxc は 128KB のリングバッファを割り当てます。
 
               <!--
             When manually specifying a size for the ringbuffer the value should
             be a power of 2 when converted to bytes. Valid size prefixes are
-            'kB', 'MB', 'GB'. (Note that all conversions are based on multiples
-            of 1024. That means 'kb' == 'KiB', 'MB' == 'MiB', 'GB' == 'GiB'.)
+            'KB', 'MB', 'GB'. (Note that all conversions are based on multiples
+            of 1024. That means 'Kb' == 'KiB', 'MB' == 'MiB', 'GB' == 'GiB'.
+            Additionally, the case of the suffix is ignored, i.e. 'kB', 'KB' and
+            'Kb' are treated equally.)
                 -->
-              リングバッファサイズを数値指定する場合、値がバイトに変換されるときに 2 の累乗になります。サイズ接頭辞付きの単位として 'kB'、'MB'、'GB' が使えます。(この場合の変換は 1024 の倍数に基づいています。つまり 'kB' == 'KiB'、'MB' == 'MiB'、'GB' == 'GiB' という意味です。)
+              リングバッファサイズを数値指定する場合、値がバイトに変換されるときに 2 の累乗になります。サイズ接頭辞付きの単位として 'KB'、'MB'、'GB' が使えます。(この場合の変換は 1024 の倍数に基づいています。つまり 'KB' == 'KiB'、'MB' == 'MiB'、'GB' == 'GiB' という意味です。加えて、単位の大文字小文字は無視されます。すなわち 'kB'、'KB'、'Kb' は同一に扱われます。)
             </para>
           </listitem>
         </varlistentry>
@@ -1098,23 +1103,25 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
             <option>lxc.console.logfile</option>. Note that size of the log file
             must be at least as big as a standard page size. When passed a value
             smaller than a single page size liblxc will set the size of log file
-            to a single page size. A page size is usually 4kB.
+            to a single page size. A page size is usually 4KB.
             -->
-              liblxc は <option>lxc.console.logfile</option> で指定したコンソールログのサイズを、このオプションで設定した値に制限します。ログファイルのサイズは少なくとも標準ページサイズでなければなりません。ページサイズ以下の値を設定した場合は、liblxc はログファイルのサイズをページサイズに設定します。ページサイズは通常は 4kB です。
+              liblxc は <option>lxc.console.logfile</option> で指定したコンソールログのサイズを、このオプションで設定した値に制限します。ログファイルのサイズは少なくとも標準ページサイズでなければなりません。ページサイズ以下の値を設定した場合は、liblxc はログファイルのサイズをページサイズに設定します。ページサイズは通常は 4KB です。
 
               <!--
-            The keyword 'auto' will cause liblxc to place a limit of 128kB on
+            The keyword 'auto' will cause liblxc to place a limit of 128KB on
             the log file.
                 -->
-              'auto' を指定すると、liblxc はログファイルのサイズを 128kB に制限します。
+              'auto' を指定すると、liblxc はログファイルのサイズを 128KB に制限します。
 
               <!--
             When manually specifying a size for the log file the value should
             be a power of 2 when converted to bytes. Valid size prefixes are
-            'kB', 'MB', 'GB'. (Note that all conversions are based on multiples
-            of 1024. That means 'kb' == 'KiB', 'MB' == 'MiB', 'GB' == 'GiB'.)
+            'KB', 'MB', 'GB'. (Note that all conversions are based on multiples
+            of 1024. That means 'KB' == 'KiB', 'MB' == 'MiB', 'GB' == 'GiB'.
+            Additionally, the case of the suffix is ignored, i.e. 'kB', 'KB' and
+            'Kb' are treated equally.)
                 -->
-              ログファイルサイズの値を数値指定する場合、値がバイトに変換されるときに 2 の累乗になります。サイズ接頭辞付きの単位として 'kB'、'MB'、'GB' が使えます。(この場合の変換は 1024 の倍数に基づいています。つまり 'kB' == 'KiB'、'MB' == 'MiB'、'GB' == 'GiB' という意味です。)
+              ログファイルサイズの値を数値指定する場合、値がバイトに変換されるときに 2 の累乗になります。サイズ接頭辞付きの単位として 'kB'、'MB'、'GB' が使えます。(この場合の変換は 1024 の倍数に基づいています。つまり 'kB' == 'KiB'、'MB' == 'MiB'、'GB' == 'GiB' という意味です。加えて、単位の大文字小文字は無視されます。すなわち 'kB'、'KB'、'Kb' は同一に扱われます。)
 
               <!--
             If users want to mirror the console ringbuffer on disk they should set
@@ -1883,7 +1890,7 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
       <variablelist>
         <varlistentry>
           <term>
-            <option>lxc.cgroup.[controll name]</option>
+            <option>lxc.cgroup.[control name]</option>
           </term>
           <listitem>
             <para>
@@ -1909,7 +1916,7 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
             <para>
               <!--
               Specify the control group value to be set on the unified cgroup
-              shierarchy. The controller name is the literal name of the control
+              hierarchy. The controller name is the literal name of the control
               group. The permitted names and the syntax of their values is not
               dictated by LXC, instead it depends on the features of the Linux
               kernel running at the time the container is started, eg.
@@ -2095,7 +2102,7 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
             container wants to inherit the network namespace it needs to inherit
             the user namespace as well.
                 -->
-              コンテナが新しいユーザ名前空間をリクエストし、そのコンテナがネットワーク名前空間は継承したい場合は、ユーザ名前空間は継承する必要があることに注意してください。
+              コンテナが新しいユーザ名前空間をリクエストし、そのコンテナがネットワーク名前空間は継承したい場合は、ユーザ名前空間も同様に継承する必要があることに注意してください。
             </para>
           </listitem>
         </varlistentry>
@@ -2265,7 +2272,7 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
         container should be run can be specified in the container
         configuration.  The default is <command>lxc-container-default-cgns</command>
         if the host kernel is cgroup namespace aware, or
-        <command>lxc-container-default</command> othewise.
+        <command>lxc-container-default</command> otherwise.
         -->
         lxc が apparmor サポートでコンパイルされ、インストールされている場合で、ホストで apparmor が有効な場合、コンテナが従って動くべき apparmor プロファイルは、コンテナの設定で指定することが可能です。
         デフォルトは、ホストのカーネルで cgroup 名前空間が使える場合は <command>lxc-container-default-cgns</command>です。使えない場合は <command>lxc-container-default</command> です。
@@ -2381,7 +2388,7 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
         Versions 1 and 2 are currently supported.  In version 1, the
         policy is a simple whitelist.  The second line therefore must
         read "whitelist", with the rest of the file containing one (numeric)
-        sycall number per line.  Each syscall number is whitelisted,
+        syscall number per line.  Each syscall number is whitelisted,
         while every unlisted number is blacklisted for use in the container
         -->
         現時点では、バージョン番号は 1 と 2 をサポートしています。バージョン 1 では、ポリシーはシンプルなホワイトリストですので、2 行目は "whitelist" でなければなりません。
@@ -2423,6 +2430,24 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
               load before the container starts.
               -->
               コンテナがスタートする前にロードする seccomp の設定を含むファイルを指定します。
+             </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>
+            <option>lxc.seccomp.allow_nesting</option>
+          </term>
+          <listitem>
+            <para>
+	      <!--
+              If this flag is set to 1, then seccomp filters will be stacked
+              regardless of whether a seccomp profile is already loaded.
+              This allows nested containers to load their own seccomp profile.
+              The default setting is 0.
+		-->
+	      このオプションを 1 に設定すると、すでに seccomp プロファイルがロードされている、いないに関わらず、seccomp フィルタが重ね合わせられます。
+	      これにより、ネストされたコンテナが自身の seccomp プロファイルをロードできます。
+	      デフォルト値は 0 です。
              </para>
           </listitem>
         </varlistentry>
@@ -3149,6 +3174,25 @@ by KATOH Yasufumi <karma at jazz.email.ne.jp>
               Default is 0.
                 -->
               この値が 0 でない場合、コンテナが初期化される前 (pre-start フックが実行される前) にマウント名前空間がホストから unshare されます。この機能を使う場合、スタート時に CAP_SYS_ADMIN ケーパビリティが必要です。デフォルト値は 0 です。
+            </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>
+            <option>lxc.monitor.signal.pdeath</option>
+          </term>
+          <listitem>
+            <para>
+	      <!--
+              Set the signal to be sent to the container's init when the lxc
+              monitor exits. By default it is set to SIGKILL which will cause
+              all container processes to be killed when the lxc monitor process
+              dies.
+              To ensure that containers stay alive even if lxc monitor dies set
+              this to 0.
+		-->
+	      lxc のモニタプロセスが終了した際に、コンテナの init プロセスに送出するシグナルを指定します。デフォルトでは、lxc のモニタプロセスが終了した場合には、すべてのコンテナ内のプロセスが停止するように SIGKILL が設定されています。
+	      lxc のモニタプロセスが終了しても、コンテナがすべて確実に動作しつづけるようにするには、この値を 0 に設定します。
             </para>
           </listitem>
         </varlistentry>

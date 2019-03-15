@@ -21,36 +21,33 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <libgen.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <lxc/lxccontainer.h>
 
 #include "arguments.h"
-#include "tool_utils.h"
+#include "config.h"
+#include "log.h"
 
-static int my_checker(const struct lxc_arguments* args)
-{
-	if (!args->argc) {
-		lxc_error(args, "missing state object");
-		return -1;
-	}
+lxc_log_define(lxc_cgroup, lxc);
 
-	return 0;
-}
+static int my_checker(const struct lxc_arguments *args);
 
 static const struct option my_longopts[] = {
 	LXC_COMMON_OPTIONS
 };
 
 static struct lxc_arguments my_args = {
-	.progname = "lxc-cgroup",
-	.help     = "\
+	.progname     = "lxc-cgroup",
+	.help         = "\
 --name=NAME state-object [value]\n\
 \n\
 Get or set the value of a state object (for example, 'cpuset.cpus')\n\
@@ -59,10 +56,22 @@ in the container's cgroup for the corresponding subsystem.\n\
 Options :\n\
   -n, --name=NAME      NAME of the container\n\
   --rcfile=FILE        Load configuration file FILE\n",
-	.options  = my_longopts,
-	.parser   = NULL,
-	.checker  = my_checker,
+	.options      = my_longopts,
+	.parser       = NULL,
+	.checker      = my_checker,
+	.log_priority = "ERROR",
+	.log_file     = "none",
 };
+
+static int my_checker(const struct lxc_arguments *args)
+{
+	if (!args->argc) {
+		ERROR("Missing state object");
+		return -1;
+	}
+
+	return 0;
+}
 
 int main(int argc, char *argv[])
 {
@@ -72,9 +81,6 @@ int main(int argc, char *argv[])
 
 	if (lxc_arguments_parse(&my_args, argc, argv))
 		exit(EXIT_FAILURE);
-
-	if (!my_args.log_file)
-		my_args.log_file = "none";
 
 	log.name = my_args.name;
 	log.file = my_args.log_file;
@@ -94,51 +100,58 @@ int main(int argc, char *argv[])
 
 	if (my_args.rcfile) {
 		c->clear_config(c);
+
 		if (!c->load_config(c, my_args.rcfile)) {
-			fprintf(stderr, "Failed to load rcfile\n");
+			ERROR("Failed to load rcfile");
 			lxc_container_put(c);
 			exit(EXIT_FAILURE);
 		}
+
 		c->configfile = strdup(my_args.rcfile);
 		if (!c->configfile) {
-			fprintf(stderr, "Out of memory setting new config filename\n");
+			ERROR("Out of memory setting new config filename");
 			lxc_container_put(c);
 			exit(EXIT_FAILURE);
 		}
 	}
 
 	if (!c->may_control(c)) {
-		fprintf(stderr, "Insufficent privileges to control %s:%s\n", my_args.lxcpath[0], my_args.name);
+		ERROR("Insufficent privileges to control %s:%s", my_args.lxcpath[0], my_args.name);
 		lxc_container_put(c);
 		exit(EXIT_FAILURE);
 	}
 
 	if (!c->is_running(c)) {
-		fprintf(stderr, "'%s:%s' is not running\n", my_args.lxcpath[0], my_args.name);
+		ERROR("'%s:%s' is not running", my_args.lxcpath[0], my_args.name);
 		lxc_container_put(c);
 		exit(EXIT_FAILURE);
 	}
 
 	if ((my_args.argc) > 1) {
 		value = my_args.argv[1];
+
 		if (!c->set_cgroup_item(c, state_object, value)) {
-			fprintf(stderr, "failed to assign '%s' value to '%s' for '%s'\n",
-				value, state_object, my_args.name);
+			ERROR("Failed to assign '%s' value to '%s' for '%s'",
+			      value, state_object, my_args.name);
 			lxc_container_put(c);
 			exit(EXIT_FAILURE);
 		}
 	} else {
-		char buffer[TOOL_MAXPATHLEN];
-		int ret = c->get_cgroup_item(c, state_object, buffer, TOOL_MAXPATHLEN);
+		char buffer[PATH_MAX];
+		int ret;
+
+		ret = c->get_cgroup_item(c, state_object, buffer, PATH_MAX);
 		if (ret < 0) {
-			fprintf(stderr, "failed to retrieve value of '%s' for '%s:%s'\n",
+			ERROR("Failed to retrieve value of '%s' for '%s:%s'",
 			      state_object, my_args.lxcpath[0], my_args.name);
 			lxc_container_put(c);
 			exit(EXIT_FAILURE);
 		}
-		printf("%*s", ret, buffer);
+
+		printf("%*s\n", ret, buffer);
 	}
 
 	lxc_container_put(c);
+
 	exit(EXIT_SUCCESS);
 }

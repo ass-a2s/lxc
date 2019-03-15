@@ -21,9 +21,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
-#include "config.h"
-
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
@@ -32,92 +32,204 @@
 #include <sys/prctl.h>
 
 #include "caps.h"
+#include "config.h"
+#include "file_utils.h"
 #include "log.h"
+#include "macro.h"
 
-lxc_log_define(lxc_caps, lxc);
+lxc_log_define(caps, lxc);
 
 #if HAVE_LIBCAP
-
-#ifndef PR_CAPBSET_READ
-#define PR_CAPBSET_READ 23
-#endif
 
 int lxc_caps_down(void)
 {
 	cap_t caps;
-	int ret;
+	int ret = -1;
 
-	/* when we are run as root, we don't want to play
-	 * with the capabilities */
+	/* When we are root, we don't want to play with capabilities. */
 	if (!getuid())
 		return 0;
 
 	caps = cap_get_proc();
 	if (!caps) {
-		ERROR("failed to cap_get_proc: %s", strerror(errno));
-		return -1;
+		SYSERROR("Failed to retrieve capabilities");
+		return ret;
 	}
 
 	ret = cap_clear_flag(caps, CAP_EFFECTIVE);
 	if (ret) {
-		ERROR("failed to cap_clear_flag: %s", strerror(errno));
-		goto out;
+		SYSERROR("Failed to clear effective capabilities");
+		goto on_error;
 	}
 
 	ret = cap_set_proc(caps);
 	if (ret) {
-		ERROR("failed to cap_set_proc: %s", strerror(errno));
-		goto out;
+		SYSERROR("Failed to change effective capabilities");
+		goto on_error;
 	}
 
-out:
+	ret = 0;
+
+on_error:
 	cap_free(caps);
-	return 0;
+
+	return ret;
 }
 
 int lxc_caps_up(void)
 {
 	cap_t caps;
 	cap_value_t cap;
-	int ret;
+	int ret = -1;
 
-	/* when we are run as root, we don't want to play
-	 * with the capabilities */
+	/* When we are root, we don't want to play with capabilities. */
 	if (!getuid())
 		return 0;
 
 	caps = cap_get_proc();
 	if (!caps) {
-		ERROR("failed to cap_get_proc: %s", strerror(errno));
-		return -1;
+		SYSERROR("Failed to retrieve capabilities");
+		return ret;
 	}
 
 	for (cap = 0; cap <= CAP_LAST_CAP; cap++) {
-
 		cap_flag_value_t flag;
 
 		ret = cap_get_flag(caps, cap, CAP_PERMITTED, &flag);
 		if (ret) {
 			if (errno == EINVAL) {
-				INFO("Last supported cap was %d", cap-1);
+				INFO("Last supported cap was %d", cap - 1);
 				break;
 			} else {
-				ERROR("failed to cap_get_flag: %s",
-				      strerror(errno));
-				goto out;
+				SYSERROR("Failed to retrieve setting for "
+					 "permitted capability %d", cap - 1);
+				goto on_error;
 			}
 		}
 
 		ret = cap_set_flag(caps, CAP_EFFECTIVE, 1, &cap, flag);
 		if (ret) {
-			ERROR("failed to cap_set_flag: %s", strerror(errno));
-			goto out;
+			SYSERROR("Failed to set effective capability %d", cap - 1);
+			goto on_error;
 		}
 	}
 
 	ret = cap_set_proc(caps);
 	if (ret) {
-		ERROR("failed to cap_set_proc: %s", strerror(errno));
+		SYSERROR("Failed to change effective capabilities");
+		goto on_error;
+	}
+
+	ret = 0;
+
+on_error:
+	cap_free(caps);
+
+	return ret;
+}
+
+int lxc_ambient_caps_up(void)
+{
+	int ret;
+	cap_t caps;
+	cap_value_t cap;
+	int last_cap = CAP_LAST_CAP;
+	char *cap_names = NULL;
+
+	if (!getuid() || geteuid())
+		return 0;
+
+	caps = cap_get_proc();
+	if (!caps) {
+		SYSERROR("Failed to retrieve capabilities");
+		return -1;
+	}
+
+	for (cap = 0; cap <= CAP_LAST_CAP; cap++) {
+		cap_flag_value_t flag;
+
+		ret = cap_get_flag(caps, cap, CAP_PERMITTED, &flag);
+		if (ret < 0) {
+			if (errno == EINVAL) {
+				last_cap = (cap - 1);
+				INFO("Last supported cap was %d", last_cap);
+				break;
+			}
+
+			SYSERROR("Failed to retrieve capability flag");
+			goto out;
+		}
+
+		ret = cap_set_flag(caps, CAP_INHERITABLE, 1, &cap, flag);
+		if (ret < 0) {
+			SYSERROR("Failed to set capability flag");
+			goto out;
+		}
+	}
+
+	ret = cap_set_proc(caps);
+	if (ret < 0) {
+		SYSERROR("Failed to set capabilities");
+		goto out;
+	}
+
+	for (cap = 0; cap <= last_cap; cap++) {
+		ret = prctl(PR_CAP_AMBIENT, prctl_arg(PR_CAP_AMBIENT_RAISE),
+			    prctl_arg(cap), prctl_arg(0), prctl_arg(0));
+		if (ret < 0) {
+			SYSWARN("Failed to raise ambient capability %d", cap);
+			goto out;
+		}
+	}
+
+	cap_names = cap_to_text(caps, NULL);
+	if (!cap_names) {
+		SYSWARN("Failed to convert capabilities %d", cap);
+		goto out;
+	}
+
+	TRACE("Raised %s in inheritable and ambient capability set", cap_names);
+
+out:
+
+	cap_free(cap_names);
+	cap_free(caps);
+	return 0;
+}
+
+int lxc_ambient_caps_down(void)
+{
+	int ret;
+	cap_t caps;
+	cap_value_t cap;
+
+	if (!getuid() || geteuid())
+		return 0;
+
+	ret = prctl(PR_CAP_AMBIENT, prctl_arg(PR_CAP_AMBIENT_CLEAR_ALL),
+		    prctl_arg(0), prctl_arg(0), prctl_arg(0));
+	if (ret < 0) {
+		SYSERROR("Failed to clear ambient capability set");
+		return -1;
+	}
+
+	caps = cap_get_proc();
+	if (!caps) {
+		SYSERROR("Failed to retrieve capabilities");
+		return -1;
+	}
+
+	for (cap = 0; cap <= CAP_LAST_CAP; cap++) {
+		ret = cap_set_flag(caps, CAP_INHERITABLE, 1, &cap, CAP_CLEAR);
+		if (ret < 0) {
+			SYSERROR("Failed to remove capability from inheritable set");
+			goto out;
+		}
+	}
+
+	ret = cap_set_proc(caps);
+	if (ret < 0) {
+		SYSERROR("Failed to set capabilities");
 		goto out;
 	}
 
@@ -128,64 +240,66 @@ out:
 
 int lxc_caps_init(void)
 {
-	uid_t uid = getuid();
-	gid_t gid = getgid();
-	uid_t euid = geteuid();
+	uid_t euid, uid;
 
-	if (!uid) {
-		INFO("command is run as 'root'");
+	uid = getuid();
+	if (!uid)
 		return 0;
-	}
 
+	euid = geteuid();
 	if (uid && !euid) {
-		INFO("command is run as setuid root (uid : %d)", uid);
+		int ret;
+		gid_t gid;
 
-		if (prctl(PR_SET_KEEPCAPS, 1)) {
-			ERROR("failed to 'PR_SET_KEEPCAPS': %s",
-			      strerror(errno));
+		INFO("Command is run as setuid root (uid: %d)", uid);
+
+		ret = prctl(PR_SET_KEEPCAPS, prctl_arg(1));
+		if (ret < 0) {
+			SYSERROR("Failed to set PR_SET_KEEPCAPS");
 			return -1;
 		}
 
-		if (setresgid(gid, gid, gid)) {
-			ERROR("failed to change gid to '%d': %s", gid,
-			      strerror(errno));
+		gid = getgid();
+		ret = setresgid(gid, gid, gid);
+		if (ret < 0) {
+			SYSERROR("Failed to change rgid, egid, and sgid to %d", gid);
 			return -1;
 		}
 
-		if (setresuid(uid, uid, uid)) {
-			ERROR("failed to change uid to '%d': %s", uid,
-			      strerror(errno));
+		ret = setresuid(uid, uid, uid);
+		if (ret < 0) {
+			SYSERROR("Failed to change ruid, euid, and suid to %d", uid);
 			return -1;
 		}
 
-		if (lxc_caps_up()) {
-			ERROR("failed to restore capabilities: %s",
-			      strerror(errno));
+		ret = lxc_caps_up();
+		if (ret < 0) {
+			SYSERROR("Failed to restore capabilities");
 			return -1;
 		}
 	}
 
 	if (uid == euid)
-		INFO("command is run as user '%d'", uid);
+		INFO("Command is run with uid %d", uid);
 
 	return 0;
 }
 
-static int _real_caps_last_cap(void)
+static long int _real_caps_last_cap(void)
 {
-	int fd;
-	int result = -1;
+	int fd, result = -1;
 
-	/* try to get the maximum capability over the kernel
-	* interface introduced in v3.2 */
-	fd = open("/proc/sys/kernel/cap_last_cap", O_RDONLY);
+	/* Try to get the maximum capability over the kernel interface
+	 * introduced in v3.2.
+	 */
+	fd = open("/proc/sys/kernel/cap_last_cap", O_RDONLY | O_CLOEXEC);
 	if (fd >= 0) {
-		char buf[32];
+		ssize_t n;
 		char *ptr;
-		int n;
+		char buf[INTTYPE_TO_STRLEN(int)] = {0};
 
-		if ((n = read(fd, buf, 31)) >= 0) {
-			buf[n] = '\0';
+		n = lxc_read_nointr(fd, buf, STRARRAYLEN(buf));
+		if (n >= 0) {
 			errno = 0;
 			result = strtol(buf, &ptr, 10);
 			if (!ptr || (*ptr != '\0' && *ptr != '\n') || errno != 0)
@@ -193,13 +307,15 @@ static int _real_caps_last_cap(void)
 		}
 
 		close(fd);
-	}
-
-	/* try to get it manually by trying to get the status of
-	* each capability indiviually from the kernel */
-	if (result < 0) {
+	} else {
 		int cap = 0;
-		while (prctl(PR_CAPBSET_READ, cap) >= 0) cap++;
+
+		/* Try to get it manually by trying to get the status of each
+		 * capability individually from the kernel.
+		 */
+		while (prctl(PR_CAPBSET_READ, prctl_arg(cap)) >= 0)
+			cap++;
+
 		result = cap - 1;
 	}
 
@@ -208,8 +324,13 @@ static int _real_caps_last_cap(void)
 
 int lxc_caps_last_cap(void)
 {
-	static int last_cap = -1;
-	if (last_cap < 0) last_cap = _real_caps_last_cap();
+	static long int last_cap = -1;
+
+	if (last_cap < 0) {
+		last_cap = _real_caps_last_cap();
+		if (last_cap < 0 || last_cap > INT_MAX)
+			last_cap = -1;
+	}
 
 	return last_cap;
 }
@@ -221,7 +342,7 @@ static bool lxc_cap_is_set(cap_t caps, cap_value_t cap, cap_flag_t flag)
 
 	ret = cap_get_flag(caps, cap, flag, &flagval);
 	if (ret < 0) {
-		ERROR("Failed to perform cap_get_flag(): %s.", strerror(errno));
+		SYSERROR("Failed to retrieve current setting for capability %d", cap);
 		return false;
 	}
 
@@ -230,7 +351,7 @@ static bool lxc_cap_is_set(cap_t caps, cap_value_t cap, cap_flag_t flag)
 
 bool lxc_file_cap_is_set(const char *path, cap_value_t cap, cap_flag_t flag)
 {
-	#if LIBCAP_SUPPORTS_FILE_CAPABILITIES
+#if LIBCAP_SUPPORTS_FILE_CAPABILITIES
 	bool cap_is_set;
 	cap_t caps;
 
@@ -242,17 +363,18 @@ bool lxc_file_cap_is_set(const char *path, cap_value_t cap, cap_flag_t flag)
 		 * case errno will be set to ENODATA.
 		 */
 		if (errno != ENODATA)
-			ERROR("Failed to perform cap_get_file(): %s.\n", strerror(errno));
+			SYSERROR("Failed to retrieve capabilities for file %s", path);
+
 		return false;
 	}
 
 	cap_is_set = lxc_cap_is_set(caps, cap, flag);
 	cap_free(caps);
 	return cap_is_set;
-	#else
+#else
 	errno = ENODATA;
 	return false;
-	#endif
+#endif
 }
 
 bool lxc_proc_cap_is_set(cap_value_t cap, cap_flag_t flag)
@@ -262,7 +384,7 @@ bool lxc_proc_cap_is_set(cap_value_t cap, cap_flag_t flag)
 
 	caps = cap_get_proc();
 	if (!caps) {
-		ERROR("Failed to perform cap_get_proc(): %s.\n", strerror(errno));
+		SYSERROR("Failed to retrieve capabilities");
 		return false;
 	}
 
@@ -270,5 +392,4 @@ bool lxc_proc_cap_is_set(cap_value_t cap, cap_flag_t flag)
 	cap_free(caps);
 	return cap_is_set;
 }
-
 #endif

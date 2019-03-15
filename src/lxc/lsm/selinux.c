@@ -21,21 +21,25 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <errno.h>
-#include <stdlib.h>
-#include <stdbool.h>
-#include <string.h>
-#include <unistd.h>
 #include <selinux/selinux.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include "conf.h"
+#include "config.h"
 #include "log.h"
 #include "lsm.h"
 
 #define DEFAULT_LABEL "unconfined_t"
 
-lxc_log_define(lxc_lsm_selinux, lxc);
+lxc_log_define(selinux, lsm);
 
 /*
  * selinux_process_label_get: Get SELinux context of a process
@@ -74,15 +78,13 @@ static char *selinux_process_label_get(pid_t pid)
  * Notes: This relies on /proc being available.
  */
 static int selinux_process_label_set(const char *inlabel, struct lxc_conf *conf,
-				     bool use_default, bool on_exec)
+				     bool on_exec)
 {
 	int ret;
 	const char *label;
 
 	label = inlabel ? inlabel : conf->lsm_se_context;
 	if (!label) {
-		if (!use_default)
-			return -EINVAL;
 
 		label = DEFAULT_LABEL;
 	}

@@ -13,7 +13,7 @@ Type            | Service               | Status
 CI (Linux)      | Jenkins               | [![Build Status](https://jenkins.linuxcontainers.org/job/lxc-github-commit/badge/icon)](https://jenkins.linuxcontainers.org/job/lxc-github-commit/)
 CI (Linux)      | Travis                | [![Build Status](https://travis-ci.org/lxc/lxc.svg?branch=master)](https://travis-ci.org/lxc/lxc/)
 Project status  | CII Best Practices    | [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/1087/badge)](https://bestpractices.coreinfrastructure.org/projects/1087)
-Static Analysis | Coverity              | <a href="https://scan.coverity.com/projects/lxc-linux-containers"> <img alt="Coverity Scan Build Status" src="https://img.shields.io/coverity/scan/369.svg"/> </a>
+Code Quality    | LGTM                  | [![Language grade: C/C++](https://img.shields.io/lgtm/grade/cpp/g/lxc/lxc.svg?logo=lgtm&logoWidth=18)](https://lgtm.com/projects/g/lxc/lxc/context:cpp)
 
 ## System Containers
 
@@ -127,7 +127,7 @@ The LXC project has a good reputation in handling security issues quickly and
 efficiently. If you think you've found a potential security issue, please
 report it by e-mail to all of the following persons:
 
-- serge.hallyn (at) ubuntu (dot) com
+- serge (at) hallyn (dot) com
 - stgraber (at) ubuntu (dot) com
 - christian.brauner (at) ubuntu (dot) com
 
@@ -151,7 +151,7 @@ repo.
 If you want to become more active it is usually also a good idea to show up in
 the LXC IRC channel `#lxc-dev` on `Freenode`. We try to do all development out
 in the open and discussion of new features or bugs is done either in
-appropriate Github issues or on IRC.
+appropriate GitHub issues or on IRC.
 
 When thinking about making security critical contributions or substantial
 changes it is usually a good idea to ping the developers first and ask whether

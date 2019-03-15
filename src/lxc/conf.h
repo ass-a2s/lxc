@@ -23,22 +23,28 @@
 #ifndef __LXC_CONF_H
 #define __LXC_CONF_H
 
-#include "config.h"
-
-#include <stdio.h>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#include <linux/magic.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <sys/param.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
+
+#include "compiler.h"
+#include "config.h"
+#include "list.h"
+#include "ringbuf.h"
+#include "start.h"
+#include "terminal.h"
+
 #if HAVE_SYS_RESOURCE_H
 #include <sys/resource.h>
 #endif
-#include <stdbool.h>
-
-#include "list.h"
-#include "ringbuf.h"
-#include "start.h" /* for lxc_handler */
-#include "terminal.h"
 
 #if HAVE_SCMP_FILTER_CTX
 typedef void * scmp_filter_ctx;
@@ -73,17 +79,19 @@ struct lxc_cgroup {
 		struct /* meta */ {
 			char *controllers;
 			char *dir;
+			bool relative;
 		};
 	};
 };
 
 #if !HAVE_SYS_RESOURCE_H
-# define RLIM_INFINITY ((unsigned long)-1)
+#define RLIM_INFINITY ((unsigned long)-1)
 struct rlimit {
 	unsigned long rlim_cur;
 	unsigned long rlim_max;
 };
 #endif
+
 /*
  * Defines a structure to configure resource limits to set via setrlimit().
  * @resource : the resource name in lowercase without the RLIMIT_ prefix
@@ -136,10 +144,12 @@ struct id_map {
 
 /* Defines the number of tty configured and contains the
  * instantiated ptys
- * @nbtty = number of configured ttys
+ * @max = number of configured ttys
  */
 struct lxc_tty_info {
-	int nbtty;
+	size_t max;
+	char *dir;
+	char *tty_names;
 	struct lxc_terminal_info *tty;
 };
 
@@ -147,65 +157,57 @@ struct lxc_tty_info {
  * optionals pivot_root, rootfs mount paths
  * @path       : the rootfs source (directory or device)
  * @mount      : where it is mounted
- * @options    : mount options
  * @bev_type   : optional backing store type
+ * @options    : mount options
+ * @mountflags : the portion of @options that are flags
+ * @data       : the portion of @options that are not flags
+ * @managed    : whether it is managed by LXC
  */
 struct lxc_rootfs {
 	char *path;
 	char *mount;
-	char *options;
 	char *bdev_type;
+	char *options;
+	unsigned long mountflags;
+	char *data;
+	bool managed;
 };
 
 /*
  * Automatic mounts for LXC to perform inside the container
  */
 enum {
-	LXC_AUTO_PROC_RW              = 0x001,   /* /proc read-write */
-	LXC_AUTO_PROC_MIXED           = 0x002,   /* /proc/sys and /proc/sysrq-trigger read-only */
+	LXC_AUTO_PROC_RW              = 0x001, /* /proc read-write */
+	LXC_AUTO_PROC_MIXED           = 0x002, /* /proc/sys and /proc/sysrq-trigger read-only */
 	LXC_AUTO_PROC_MASK            = 0x003,
 
-	LXC_AUTO_SYS_RW               = 0x004,   /* /sys */
-	LXC_AUTO_SYS_RO               = 0x008,   /* /sys read-only */
-	LXC_AUTO_SYS_MIXED            = 0x00C,   /* /sys read-only and /sys/class/net read-write */
+	LXC_AUTO_SYS_RW               = 0x004, /* /sys */
+	LXC_AUTO_SYS_RO               = 0x008, /* /sys read-only */
+	LXC_AUTO_SYS_MIXED            = 0x00C, /* /sys read-only and /sys/class/net read-write */
 	LXC_AUTO_SYS_MASK             = 0x00C,
 
-	LXC_AUTO_CGROUP_RO            = 0x010,   /* /sys/fs/cgroup (partial mount, read-only) */
-	LXC_AUTO_CGROUP_RW            = 0x020,   /* /sys/fs/cgroup (partial mount, read-write) */
-	LXC_AUTO_CGROUP_MIXED         = 0x030,   /* /sys/fs/cgroup (partial mount, paths r/o, cgroup r/w) */
-	LXC_AUTO_CGROUP_FULL_RO       = 0x040,   /* /sys/fs/cgroup (full mount, read-only) */
-	LXC_AUTO_CGROUP_FULL_RW       = 0x050,   /* /sys/fs/cgroup (full mount, read-write) */
-	LXC_AUTO_CGROUP_FULL_MIXED    = 0x060,   /* /sys/fs/cgroup (full mount, parent r/o, own r/w) */
-	/* These are defined in such a way as to retain
-	 * binary compatibility with earlier versions of
-	 * this code. If the previous mask is applied,
-	 * both of these will default back to the _MIXED
-	 * variants, which is safe. */
-	LXC_AUTO_CGROUP_NOSPEC        = 0x0B0,   /* /sys/fs/cgroup (partial mount, r/w or mixed, depending on caps) */
-	LXC_AUTO_CGROUP_FULL_NOSPEC   = 0x0E0,   /* /sys/fs/cgroup (full mount, r/w or mixed, depending on caps) */
-	LXC_AUTO_CGROUP_FORCE         = 0x100,   /* mount cgroups even when cgroup namespaces are supported */
-	LXC_AUTO_CGROUP_MASK          = 0x1F0,   /* all known cgroup options, doe not contain LXC_AUTO_CGROUP_FORCE */
-	LXC_AUTO_ALL_MASK             = 0x1FF,   /* all known settings */
+	LXC_AUTO_CGROUP_RO            = 0x010, /* /sys/fs/cgroup (partial mount, read-only) */
+	LXC_AUTO_CGROUP_RW            = 0x020, /* /sys/fs/cgroup (partial mount, read-write) */
+	LXC_AUTO_CGROUP_MIXED         = 0x030, /* /sys/fs/cgroup (partial mount, paths r/o, cgroup r/w) */
+	LXC_AUTO_CGROUP_FULL_RO       = 0x040, /* /sys/fs/cgroup (full mount, read-only) */
+	LXC_AUTO_CGROUP_FULL_RW       = 0x050, /* /sys/fs/cgroup (full mount, read-write) */
+	LXC_AUTO_CGROUP_FULL_MIXED    = 0x060, /* /sys/fs/cgroup (full mount, parent r/o, own r/w) */
+	/*
+	 * These are defined in such a way as to retain binary compatibility
+	 * with earlier versions of this code. If the previous mask is applied,
+	 * both of these will default back to the _MIXED variants, which is
+	 * safe.
+	 */
+	LXC_AUTO_CGROUP_NOSPEC        = 0x0B0, /* /sys/fs/cgroup (partial mount, r/w or mixed, depending on caps) */
+	LXC_AUTO_CGROUP_FULL_NOSPEC   = 0x0E0, /* /sys/fs/cgroup (full mount, r/w or mixed, depending on caps) */
+	LXC_AUTO_CGROUP_FORCE         = 0x100, /* mount cgroups even when cgroup namespaces are supported */
+	LXC_AUTO_CGROUP_MASK          = 0x1F0, /* all known cgroup options, doe not contain LXC_AUTO_CGROUP_FORCE */
+
+	LXC_AUTO_SHMOUNTS             = 0x200, /* shared mount point */
+	LXC_AUTO_SHMOUNTS_MASK        = 0x200, /* shared mount point mask */
+	LXC_AUTO_ALL_MASK             = 0x1FF, /* all known settings */
 };
 
-/*
- * Defines the global container configuration
- * @rootfs     : root directory to run the container
- * @mount      : list of mount points
- * @tty        : numbers of tty
- * @pts        : new pts instance
- * @mount_list : list of mount point (alternative to fstab file)
- * @network    : network configuration
- * @utsname    : container utsname
- * @fstab      : path to a fstab file format
- * @caps       : list of the capabilities to drop
- * @keepcaps   : list of the capabilities to keep
- * @ttys       : tty data
- * @console    : console data
- * @ttydir     : directory (under /dev) in which to create console and ttys
- * @lsm_aa_profile : apparmor profile to switch to or NULL
- * @lsm_se_context : selinux type to switch to or NULL
- */
 enum lxchooks {
 	LXCHOOK_PRESTART,
 	LXCHOOK_PREMOUNT,
@@ -228,40 +230,57 @@ struct lxc_state_client {
 };
 
 struct lxc_conf {
-	int is_execute;
-	char *fstab;
-	unsigned int tty;
-	unsigned int pts;
+	/* Pointer to the name of the container. Do not free! */
+	const char *name;
+	bool is_execute;
 	int reboot;
 	signed long personality;
 	struct utsname *utsname;
+
 	struct {
 		struct lxc_list cgroup;
 		struct lxc_list cgroup2;
 	};
+
 	struct {
 		struct lxc_list id_map;
 
-		/* Pointer to the idmap entry for the container's root uid in
-		 * the id_map list. Do not free! */
-		struct id_map *root_nsuid_map;
+		/*
+		 * Pointer to the idmap entry for the container's root uid in
+		 * the id_map list. Do not free!
+		 */
+		const struct id_map *root_nsuid_map;
 
-		/* Pointer to the idmap entry for the container's root gid in
-		 * the id_map list. Do not free! */
-		struct id_map *root_nsgid_map;
+		/*
+		 * Pointer to the idmap entry for the container's root gid in
+		 * the id_map list. Do not free!
+		 */
+		const struct id_map *root_nsgid_map;
 	};
+
 	struct lxc_list network;
-	int auto_mounts;
-	struct lxc_list mount_list;
+
+	struct {
+		char *fstab;
+		int auto_mounts;
+		struct lxc_list mount_list;
+	};
+
 	struct lxc_list caps;
 	struct lxc_list keepcaps;
+
+	/* /dev/tty<idx> devices */
 	struct lxc_tty_info ttys;
-	/* Comma-separated list of lxc.tty.max pty names. */
-	char *pty_names;
+	/* /dev/console device */
 	struct lxc_terminal console;
+	/* maximum pty devices allowed by devpts mount */
+	size_t pty_max;
+
+	/* set to true when rootfs has been setup */
+	bool rootfs_setup;
 	struct lxc_rootfs rootfs;
-	char *ttydir;
-	int close_all_fds;
+
+	bool close_all_fds;
 
 	struct {
 		unsigned int hooks_version;
@@ -269,10 +288,15 @@ struct lxc_conf {
 	};
 
 	char *lsm_aa_profile;
+	char *lsm_aa_profile_computed;
+	bool lsm_aa_profile_created;
+	unsigned int lsm_aa_allow_nesting;
 	unsigned int lsm_aa_allow_incomplete;
+	struct lxc_list lsm_aa_raw;
 	char *lsm_se_context;
-	int tmp_umount_proc;
+	bool tmp_umount_proc;
 	char *seccomp;  /* filename with the seccomp rules */
+	unsigned int seccomp_allow_nesting;
 #if HAVE_SCMP_FILTER_CTX
 	scmp_filter_ctx seccomp_ctx;
 #endif
@@ -283,13 +307,13 @@ struct lxc_conf {
 	int stopsignal; /* signal used to hard stop container */
 	char *rcfile;	/* Copy of the top level rcfile we read */
 
-	/* Logfile and logleve can be set in a container config file. Those
-	 * function as defaults. The defaults can be overriden by command line.
+	/* Logfile and loglevel can be set in a container config file. Those
+	 * function as defaults. The defaults can be overridden by command line.
 	 * However we don't want the command line specified values to be saved
 	 * on c->save_config(). So we store the config file specified values
 	 * here. */
-	char *logfile; /* the logfile as specifed in config */
-	int loglevel; /* loglevel as specifed in config (if any) */
+	char *logfile; /* the logfile as specified in config */
+	int loglevel; /* loglevel as specified in config (if any) */
 	int logfd;
 
 	unsigned int start_auto;
@@ -300,9 +324,7 @@ struct lxc_conf {
 
 	/* unshare the mount namespace in the monitor */
 	unsigned int monitor_unshare;
-
-	/* set to true when rootfs has been setup */
-	bool rootfs_setup;
+	unsigned int monitor_signal_pdeath;
 
 	/* list of included files */
 	struct lxc_list includes;
@@ -315,7 +337,8 @@ struct lxc_conf {
 
 	/* text representation of the config file */
 	char *unexpanded_config;
-	size_t unexpanded_len, unexpanded_alloced;
+	size_t unexpanded_len;
+	size_t unexpanded_alloced;
 
 	/* default command for lxc-execute */
 	char *execute_cmd;
@@ -365,13 +388,20 @@ struct lxc_conf {
 
 	/* procs */
 	struct lxc_list procs;
+
+	struct shmount {
+		/* Absolute path to the shared mount point on the host */
+		char *path_host;
+		/* Absolute path (in the container) to the shared mount point */
+		char *path_cont;
+	} shmount;
 };
 
 extern int write_id_mapping(enum idtype idtype, pid_t pid, const char *buf,
 			    size_t buf_size);
 
 #ifdef HAVE_TLS
-extern __thread struct lxc_conf *current_config;
+extern thread_local struct lxc_conf *current_config;
 #else
 extern struct lxc_conf *current_config;
 #endif
@@ -397,8 +427,8 @@ extern int lxc_clear_environment(struct lxc_conf *c);
 extern int lxc_clear_limits(struct lxc_conf *c, const char *key);
 extern int lxc_delete_autodev(struct lxc_handler *handler);
 extern void lxc_clear_includes(struct lxc_conf *conf);
-extern int do_rootfs_setup(struct lxc_conf *conf, const char *name,
-			   const char *lxcpath);
+extern int lxc_setup_rootfs_prepare_root(struct lxc_conf *conf,
+					 const char *name, const char *lxcpath);
 extern int lxc_setup(struct lxc_handler *handler);
 extern int lxc_setup_parent(struct lxc_handler *handler);
 extern int setup_resource_limits(struct lxc_list *limits, pid_t pid);
@@ -412,10 +442,12 @@ extern int userns_exec_full(struct lxc_conf *conf, int (*fn)(void *),
 			    void *data, const char *fn_name);
 extern int parse_mntopts(const char *mntopts, unsigned long *mntflags,
 			 char **mntdata);
+extern int parse_propagationopts(const char *mntopts, unsigned long *pflags);
 extern void tmp_proc_unmount(struct lxc_conf *lxc_conf);
 extern void remount_all_slave(void);
 extern void suggest_default_idmap(void);
-extern FILE *make_anonymous_mount_file(struct lxc_list *mount);
+extern FILE *make_anonymous_mount_file(struct lxc_list *mount,
+				       bool include_nesting_helpers);
 extern struct lxc_list *sort_cgroup_settings(struct lxc_list *cgroup_settings);
 extern unsigned long add_required_remount_flags(const char *s, const char *d,
 						unsigned long flags);
@@ -429,5 +461,7 @@ extern int setup_sysctl_parameters(struct lxc_list *sysctls);
 extern int lxc_clear_sysctls(struct lxc_conf *c, const char *key);
 extern int setup_proc_filesystem(struct lxc_list *procs, pid_t pid);
 extern int lxc_clear_procs(struct lxc_conf *c, const char *key);
+extern int lxc_clear_apparmor_raw(struct lxc_conf *c);
+extern int lxc_clear_namespace(struct lxc_conf *c);
 
 #endif /* __LXC_CONF_H */

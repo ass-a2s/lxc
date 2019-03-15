@@ -24,7 +24,7 @@
 static void usage(const char *me)
 {
 	printf("Usage: %s name [lxcpath]\n", me);
-	exit(0);
+	exit(EXIT_SUCCESS);
 }
 
 int main(int argc, char *argv[])
@@ -35,12 +35,16 @@ int main(int argc, char *argv[])
 
 	if (argc < 2)
 		usage(argv[0]);
+
 	name = argv[1];
+
 	if (argc == 3)
 		lxcpath = argv[2];
+
 	c = lxc_container_new(name, lxcpath);
 	if (c)
 		may = c->may_control(c);
+
 	printf("You may%s control %s\n", may ? "" : " not", name);
 	exit(may ? 0 : 1);
 }

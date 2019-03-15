@@ -69,7 +69,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
     </para>
 
     <para>
-      LXC has supports unprivileged containers.  Unprivileged containers are
+      LXC has support for unprivileged containers.  Unprivileged containers are
       containers that are run without any privilege.  This requires support for
       user namespaces in the kernel that the container is run on.  LXC was the
       first runtime to support unprivileged containers after user namespaces
@@ -99,7 +99,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
       </para>
 
     <para>
-      LXC namespaces configuration keys by using single dots. This means complex
+      LXC namespaces configuration keys use single dots. This means complex
       configuration keys such as <option>lxc.net.0</option> expose various
       subkeys such as <option>lxc.net.0.type</option>,
       <option>lxc.net.0.link</option>, <option>lxc.net.0.ipv6.address</option>, and
@@ -350,7 +350,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
           </term>
           <listitem>
             <para>
-              Specify the proc file name to be set. The file name available
+              Specify the proc file name to be set. The file names available
               are those listed under /proc/PID/.
               Example:
             </para>
@@ -430,7 +430,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
               network devices are usable in the container.  It also
               means that if both the container and host have upstart as
               init, 'halt' in a container (for instance) will shut down the
-              host.
+              host. Note that unprivileged containers do not work with this
+	      setting due to an inability to mount sysfs. An unsafe workaround
+	      would be to bind mount the host's sysfs.
             </para>
 
             <para>
@@ -819,15 +821,17 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
             ringbuffer. Note that ringbuffer must be at least as big as a
             standard page size. When passed a value smaller than a single page
             size liblxc will allocate a ringbuffer of a single page size. A page
-            size is usually 4kB.
+            size is usually 4KB.
 
             The keyword 'auto' will cause liblxc to allocate a ringbuffer of
-            128kB.
+            128KB.
 
             When manually specifying a size for the ringbuffer the value should
             be a power of 2 when converted to bytes. Valid size prefixes are
-            'kB', 'MB', 'GB'. (Note that all conversions are based on multiples
-            of 1024. That means 'kb' == 'KiB', 'MB' == 'MiB', 'GB' == 'GiB'.)
+            'KB', 'MB', 'GB'. (Note that all conversions are based on multiples
+            of 1024. That means 'KB' == 'KiB', 'MB' == 'MiB', 'GB' == 'GiB'.
+            Additionally, the case of the suffix is ignored, i.e. 'kB', 'KB' and
+            'Kb' are treated equally.)
             </para>
           </listitem>
         </varlistentry>
@@ -843,15 +847,17 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
             <option>lxc.console.logfile</option>. Note that size of the log file
             must be at least as big as a standard page size. When passed a value
             smaller than a single page size liblxc will set the size of log file
-            to a single page size. A page size is usually 4kB.
+            to a single page size. A page size is usually 4KB.
 
-            The keyword 'auto' will cause liblxc to place a limit of 128kB on
+            The keyword 'auto' will cause liblxc to place a limit of 128KB on
             the log file.
 
             When manually specifying a size for the log file the value should
             be a power of 2 when converted to bytes. Valid size prefixes are
-            'kB', 'MB', 'GB'. (Note that all conversions are based on multiples
-            of 1024. That means 'kb' == 'KiB', 'MB' == 'MiB', 'GB' == 'GiB'.)
+            'KB', 'MB', 'GB'. (Note that all conversions are based on multiples
+            of 1024. That means 'KB' == 'KiB', 'MB' == 'MiB', 'GB' == 'GiB'. 
+            Additionally, the case of the suffix is ignored, i.e. 'kB', 'KB' and
+            'Kb' are treated equally.)
 
             If users want to mirror the console ringbuffer on disk they should set
             <option>lxc.console.size</option> equal to
@@ -1437,7 +1443,7 @@ dev/null proc/kcore none bind,relative 0 0
           <listitem>
             <para>
               Specify the control group value to be set on the unified cgroup
-              shierarchy. The controller name is the literal name of the control
+              hierarchy. The controller name is the literal name of the control
               group. The permitted names and the syntax of their values is not
               dictated by LXC, instead it depends on the features of the Linux
               kernel running at the time the container is started, eg.
@@ -1699,7 +1705,7 @@ dev/null proc/kcore none bind,relative 0 0
         container should be run can be specified in the container
         configuration.  The default is <command>lxc-container-default-cgns</command>
 	if the host kernel is cgroup namespace aware, or
-	<command>lxc-container-default</command> othewise.
+	<command>lxc-container-default</command> otherwise.
       </para>
       <variablelist>
         <varlistentry>
@@ -1784,7 +1790,7 @@ dev/null proc/kcore none bind,relative 0 0
         Versions 1 and 2 are currently supported.  In version 1, the
         policy is a simple whitelist.  The second line therefore must
         read "whitelist", with the rest of the file containing one (numeric)
-        sycall number per line.  Each syscall number is whitelisted,
+        syscall number per line.  Each syscall number is whitelisted,
         while every unlisted number is blacklisted for use in the container
       </para>
 
@@ -1814,6 +1820,19 @@ dev/null proc/kcore none bind,relative 0 0
             <para>
               Specify a file containing the seccomp configuration to
               load before the container starts.
+             </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>
+            <option>lxc.seccomp.allow_nesting</option>
+          </term>
+          <listitem>
+            <para>
+	      If this flag is set to 1, then seccomp filters will be stacked
+	      regardless of whether a seccomp profile is already loaded.
+	      This allows nested containers to load their own seccomp profile.
+	      The default setting is 0.
              </para>
           </listitem>
         </varlistentry>
@@ -2376,6 +2395,21 @@ dev/null proc/kcore none bind,relative 0 0
         </varlistentry>
         <varlistentry>
           <term>
+            <option>lxc.monitor.signal.pdeath</option>
+          </term>
+          <listitem>
+            <para>
+              Set the signal to be sent to the container's init when the lxc
+              monitor exits. By default it is set to SIGKILL which will cause
+              all container processes to be killed when the lxc monitor process
+              dies.
+              To ensure that containers stay alive even if lxc monitor dies set
+              this to 0.
+            </para>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
+          <term>
             <option>lxc.group</option>
           </term>
           <listitem>
@@ -2444,6 +2478,13 @@ dev/null proc/kcore none bind,relative 0 0
             <programlisting>
               lxc.environment = APP_ENV=production
               lxc.environment = SYSLOG_SERVER=192.0.2.42
+            </programlisting>
+            <para>
+            It is possible to inherit host environment variables by setting the
+            name of the variable without a "=" sign. For example:
+            </para>
+            <programlisting>
+              lxc.environment = PATH
             </programlisting>
           </listitem>
         </varlistentry>

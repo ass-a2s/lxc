@@ -1,20 +1,20 @@
 #                                               -*- Autoconf -*-
 # Process this file with autoconf to produce a configure script.
 
-m4_define([lxc_devel], 0)
+m4_define([lxc_devel], 1)
 m4_define([lxc_version_major], 3)
-m4_define([lxc_version_minor], 0)
+m4_define([lxc_version_minor], 1)
 m4_define([lxc_version_micro], 0)
-m4_define([lxc_version_beta], [beta3])
+m4_define([lxc_version_beta], [])
 
 m4_define([lxc_abi_major], 1)
-m4_define([lxc_abi_minor], 4)
+m4_define([lxc_abi_minor], 5)
 m4_define([lxc_abi_micro], 0)
 m4_define([lxc_abi], [lxc_abi_major.lxc_abi_minor.lxc_abi_micro])
 
 m4_define([lxc_version_base], [lxc_version_major.lxc_version_minor.lxc_version_micro])
 m4_define([lxc_version],
-	  [ifelse(lxc_devel, 1,
+       [ifelse(lxc_devel, 1,
         ifelse(lxc_version_beta, [], [lxc_version_base], [lxc_version_base.lxc_version_beta])-devel,
         ifelse(lxc_version_beta, [], [lxc_version_base], [lxc_version_base.lxc_version_beta]))])
 
@@ -45,6 +45,22 @@ AC_CANONICAL_HOST
 AM_PROG_CC_C_O
 AC_GNU_SOURCE
 
+# Test if we have a new enough compiler.
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#define GCC_VERSION \
+	(__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__)
+
+#define CLANG_VERSION \
+	(__clang_major__ * 10000 + __clang_minor__ * 100 + __clang_patchlevel__)
+
+#if GCC_VERSION < 40700 && CLANG_VERSION < 10000
+#error Sorry, your compiler is too old - please upgrade it
+#endif
+	]])], [valid_compiler=yes], [valid_compiler=no])
+if test "x$valid_compiler" = "xno"; then
+	AC_MSG_ERROR([Sorry, your compiler is too old - please upgrade it])
+fi
+
 # libtool
 LT_INIT
 AC_SUBST([LIBTOOL_DEPS])
@@ -52,7 +68,7 @@ AC_SUBST([LIBTOOL_DEPS])
 # Detect the distribution. This is used for the default configuration and
 # for some distro-specific build options.
 AC_MSG_CHECKING([host distribution])
-AC_ARG_WITH(distro, AS_HELP_STRING([--with-distro=DISTRO], [Specify the Linux distribution to target: One of redhat, oracle, centos, fedora, suse, gentoo, debian, arch, slackware, plamo, paldo, openmandriva, pardus, sparclinux, altlinux.]))
+AC_ARG_WITH(distro, AS_HELP_STRING([--with-distro=DISTRO], [Specify the Linux distribution to target: One of redhat, redhatenterpriseserver, oracle, centos, fedora, suse, gentoo, debian, arch, slackware, plamo, paldo, openmandriva, pardus, sparclinux, altlinux.]))
 if type lsb_release >/dev/null 2>&1 && test "z$with_distro" = "z"; then
 	with_distro=`lsb_release -is`
 fi
@@ -89,7 +105,7 @@ case $with_distro in
 		distroconf=default.conf.lxcbr
 		distrosysconf="$sysconfdir/default"
 		;;
-	redhat|centos|fedora|oracle|oracleserver|sparclinux|altlinux|suse|opensuse*|plamo|pld)
+	redhat|redhatenterpriseserver|centos|fedora|oracle|oracleserver|sparclinux|altlinux|suse|opensuse*|plamo|pld)
 		distroconf=default.conf.lxcbr
 		distrosysconf="$sysconfdir/sysconfig"
 		;;
@@ -116,7 +132,7 @@ case "$with_init_script" in
 			fedora|altlinux|opensuse*)
 				init_script=systemd
 				;;
-			redhat|oracle|oracleserver|sparclinux|plamo)
+			redhat|redhatenterpriseserver|oracle|oracleserver|sparclinux|plamo)
 				init_script=sysvinit
 				;;
 			centos)
@@ -263,7 +279,7 @@ AM_CONDITIONAL([ENABLE_GNUTLS], [test "x$enable_gnutls" = "xyes"])
 
 AM_COND_IF([ENABLE_GNUTLS],
 	[AC_CHECK_HEADER([gnutls/gnutls.h],[],[AC_MSG_ERROR([You must install the GnuTLS development package in order to compile lxc])])
-	AC_CHECK_LIB([gnutls], [gnutls_hash_fast],[],[AC_MSG_ERROR([You must install the GnuTLS development package in order to compile lxc])])
+	AC_CHECK_LIB([gnutls], [gnutls_hash_fast],[true],[AC_MSG_ERROR([You must install the GnuTLS development package in order to compile lxc])])
 	AC_SUBST([GNUTLS_LIBS], [-lgnutls])])
 
 # SELinux
@@ -412,6 +428,12 @@ AC_ARG_ENABLE([commands],
 	[], [enable_commands=yes])
 AM_CONDITIONAL([ENABLE_COMMANDS], [test "x$enable_commands" = "xyes"])
 
+# Build with ASAN commands
+AC_ARG_ENABLE([asan],
+	[AC_HELP_STRING([--enable-asan], [build with address sanitizer enabled [default=no]])],
+	[], [enable_asan=no])
+AM_CONDITIONAL([ENABLE_ASAN], [test "x$enable_asan" = "xyes"])
+
 # Optional test binaries
 AC_ARG_ENABLE([tests],
 	[AC_HELP_STRING([--enable-tests], [build test/example binaries [default=no]])],
@@ -467,7 +489,14 @@ AC_ARG_WITH([cgroup-pattern],
 	[AC_HELP_STRING(
 		[--with-cgroup-pattern=pattern],
 		[pattern for container cgroups]
-	)], [], [with_cgroup_pattern=['lxc/%n']])
+	)], [], [with_cgroup_pattern=['lxc.payload/%n']])
+
+# The path for the apparmor_parser's cache for generated apparmor profiles
+AC_ARG_WITH([apparmor-cache-dir],
+	[AC_HELP_STRING(
+		[--with-apparmor-cache-dir=dir],
+		[path for apparmor_parser cache]
+	)], [], [with_apparmor_cache_dir=['${localstatedir}/cache/lxc/apparmor']])
 
 # Container log path.  By default, use $lxcpath.
 AC_MSG_CHECKING([Whether to place logfiles in container config path])
@@ -515,6 +544,7 @@ AS_AC_EXPAND(LXCBINHOOKDIR, "$libexecdir/lxc/hooks")
 AS_AC_EXPAND(LXCINITDIR, "$libexecdir")
 AS_AC_EXPAND(LOGPATH, "$with_log_path")
 AS_AC_EXPAND(RUNTIME_PATH, "$with_runtime_path")
+AS_AC_EXPAND(APPARMOR_CACHE_DIR, "$with_apparmor_cache_dir")
 AC_SUBST(DEFAULT_CGROUP_PATTERN, ["$with_cgroup_pattern"])
 
 # We need the install path so criu knows where to reference the hook scripts.
@@ -587,7 +617,12 @@ AC_CHECK_DECLS([PR_SET_NO_NEW_PRIVS], [], [], [#include <sys/prctl.h>])
 AC_CHECK_DECLS([PR_GET_NO_NEW_PRIVS], [], [], [#include <sys/prctl.h>])
 
 # Check for some headers
-AC_CHECK_HEADERS([sys/signalfd.h pty.h ifaddrs.h sys/memfd.h sys/personality.h utmpx.h sys/timerfd.h sys/resource.h])
+AC_CHECK_HEADERS([pty.h sys/memfd.h sys/personality.h sys/resource.h sys/signalfd.h sys/timerfd.h utmpx.h])
+
+AC_CHECK_HEADER([ifaddrs.h],
+	AM_CONDITIONAL(HAVE_IFADDRS_H, true)
+	AC_DEFINE(HAVE_IFADDRS_H, 1, [Have ifaddrs.h]),
+	AM_CONDITIONAL(HAVE_IFADDRS_H, false))
 
 # lookup major()/minor()/makedev()
 AC_HEADER_MAJOR
@@ -595,11 +630,21 @@ AC_HEADER_MAJOR
 # Check for some syscalls functions
 AC_CHECK_FUNCS([setns pivot_root sethostname unshare rand_r confstr faccessat gettid memfd_create])
 
+# Check for strerror_r() support. Defines:
+# - HAVE_STRERROR_R if available
+# - HAVE_DECL_STRERROR_R if defined
+# - STRERROR_R_CHAR_P if it returns char *
+AC_FUNC_STRERROR_R
+
 # Check for some functions
 AC_CHECK_LIB(pthread, main)
 AC_CHECK_FUNCS(statvfs)
 AC_CHECK_LIB(util, openpty)
 AC_CHECK_FUNCS([openpty hasmntopt setmntent endmntent utmpxname])
+AC_CHECK_FUNCS([getgrgid_r],
+	AM_CONDITIONAL(HAVE_GETGRGID_R, true)
+	AC_DEFINE(HAVE_GETGRGID_R,1,[Have getgrgid_r]),
+	AM_CONDITIONAL(HAVE_GETGRGID_R, false))
 AC_CHECK_FUNCS([getline],
 	AM_CONDITIONAL(HAVE_GETLINE, true)
 	AC_DEFINE(HAVE_GETLINE,1,[Have getline]),
@@ -612,6 +657,10 @@ AC_CHECK_FUNCS([fgetln],
 	AM_CONDITIONAL(HAVE_FGETLN, true)
 	AC_DEFINE(HAVE_FGETLN,1,[Have fgetln]),
 	AM_CONDITIONAL(HAVE_FGETLN, false))
+AC_CHECK_FUNCS([keyctl],
+	AM_CONDITIONAL(HAVE_KEYCTL, true)
+	AC_DEFINE(HAVE_KEYCTL,1,[Have keyctl]),
+	AM_CONDITIONAL(HAVE_KEYCTL, false))
 AC_CHECK_FUNCS([prlimit],
 	AM_CONDITIONAL(HAVE_PRLIMIT, true)
 	AC_DEFINE(HAVE_PRLIMIT,1,[Have prlimit]),
@@ -620,6 +669,21 @@ AC_CHECK_FUNCS([prlimit64],
 	AM_CONDITIONAL(HAVE_PRLIMIT64, true)
 	AC_DEFINE(HAVE_PRLIMIT64,1,[Have prlimit64]),
 	AM_CONDITIONAL(HAVE_PRLIMIT64, false))
+AC_CHECK_FUNCS([pthread_setcancelstate],
+	AM_CONDITIONAL(HAVE_PTHREAD_SETCANCELSTATE, true)
+	AC_DEFINE(HAVE_PTHREAD_SETCANCELSTATE,1,[Have pthread_setcancelstate]),
+	AM_CONDITIONAL(HAVE_PTHREAD_SETCANCELSTATE, false))
+AC_CHECK_FUNCS([strlcpy],
+	AM_CONDITIONAL(HAVE_STRLCPY, true)
+	AC_DEFINE(HAVE_STRLCPY,1,[Have strlcpy]),
+	AM_CONDITIONAL(HAVE_STRLCPY, false))
+AC_CHECK_FUNCS([strlcat],
+	AM_CONDITIONAL(HAVE_STRLCAT, true)
+	AC_DEFINE(HAVE_STRLCAT,1,[Have strlcat]),
+	AM_CONDITIONAL(HAVE_STRLCAT, false))
+
+# HAVE_STRUCT_RTNL_LINK_STATS64={0,1}
+AC_CHECK_TYPES([struct rtnl_link_stats64], [], [], [[#include <linux/if_link.h>]])
 
 # Check for some libraries
 AX_PTHREAD
@@ -632,11 +696,74 @@ AC_PROG_SED
 # See if we support thread-local storage.
 LXC_CHECK_TLS
 
-if test "x$GCC" = "xyes"; then
-	CFLAGS="$CFLAGS -Wall"
-	if test "x$enable_werror" = "xyes"; then
-		CFLAGS="$CFLAGS -Werror"
-	fi
+# Hardening flags
+AX_CHECK_COMPILE_FLAG([-fdiagnostics-color], [CFLAGS="$CFLAGS -fdiagnostics-color"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wimplicit-fallthrough=5], [CFLAGS="$CFLAGS -Wimplicit-fallthrough=5"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wcast-align], [CFLAGS="$CFLAGS -Wcast-align"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wstrict-prototypes], [CFLAGS="$CFLAGS -Wstrict-prototypes"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-fno-strict-aliasing], [CFLAGS="$CFLAGS -fno-strict-aliasing"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-fstack-clash-protection], [CFLAGS="$CFLAGS -fstack-clash-protection"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-fstack-protector-strong], [CFLAGS="$CFLAGS -fstack-protector-strong"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([--param=ssp-buffer-size=4], [CFLAGS="$CFLAGS --param=ssp-buffer-size=4"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-g], [CFLAGS="$CFLAGS -g"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([--mcet -fcf-protection], [CFLAGS="$CFLAGS --mcet -fcf-protection"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Werror=implicit-function-declaration], [CFLAGS="$CFLAGS -Werror=implicit-function-declaration"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wlogical-op], [CFLAGS="$CFLAGS -Wlogical-op"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wmissing-include-dirs], [CFLAGS="$CFLAGS -Wmissing-include-dirs"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wold-style-definition], [CFLAGS="$CFLAGS -Wold-style-definition"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Winit-self], [CFLAGS="$CFLAGS -Winit-self"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wfloat-equal], [CFLAGS="$CFLAGS -Wfloat-equal"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wsuggest-attribute=noreturn], [CFLAGS="$CFLAGS -Wsuggest-attribute=noreturn"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Werror=return-type], [CFLAGS="$CFLAGS -Werror=return-type"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Werror=incompatible-pointer-types], [CFLAGS="$CFLAGS -Werror=incompatible-pointer-types"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wformat=2], [CFLAGS="$CFLAGS -Wformat=2"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wshadow], [CFLAGS="$CFLAGS -Wshadow"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wendif-labels], [CFLAGS="$CFLAGS -Wendif-labels"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Werror=overflow], [CFLAGS="$CFLAGS -Werror=overflow"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-fdiagnostics-show-option], [CFLAGS="$CFLAGS -fdiagnostics-show-option"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Werror=shift-count-overflow], [CFLAGS="$CFLAGS -Werror=shift-count-overflow"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Werror=shift-overflow=2], [CFLAGS="$CFLAGS -Werror=shift-overflow=2"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wdate-time], [CFLAGS="$CFLAGS -Wdate-time"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-Wnested-externs], [CFLAGS="$CFLAGS -Wnested-externs"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-fasynchronous-unwind-tables], [CFLAGS="$CFLAGS -fasynchronous-unwind-tables"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-pipe], [CFLAGS="$CFLAGS -pipe"],,[-Werror])
+AX_CHECK_COMPILE_FLAG([-fexceptions], [CFLAGS="$CFLAGS -fexceptions"],,[-Werror])
+
+AX_CHECK_LINK_FLAG([-z relro], [LDLAGS="$LDLAGS -z relro"],,[])
+AX_CHECK_LINK_FLAG([-z now], [LDLAGS="$LDLAGS -z now"],,[])
+
+CFLAGS="$CFLAGS -Wvla -std=gnu11"
+if test "x$enable_werror" = "xyes"; then
+	CFLAGS="$CFLAGS -Werror"
+fi
+
+AC_ARG_ENABLE([thread-safety],
+	[AC_HELP_STRING([--enable-thread-safety], [enforce thread-safety otherwise fail the build [default=yes]])],
+	[], [enable_thread_safety=yes])
+AM_CONDITIONAL([ENFORCE_THREAD_SAFETY], [test "x$enable_thread_safety" = "xyes"])
+
+AC_ARG_ENABLE([dlog],
+	[AC_HELP_STRING([--enable-dlog], [enable dlog support [default=no]])],
+	[], [enable_dlog=no])
+AM_CONDITIONAL([ENABLE_DLOG], [test "x$enable_dlog" = "xyes"])
+
+AM_COND_IF([ENABLE_DLOG],
+	[PKG_CHECK_MODULES([DLOG],[dlog],[],[
+		AC_CHECK_HEADER([dlog.h],[],[AC_MSG_ERROR([You must install the dlog development package in order to compile lxc])])
+		AC_CHECK_LIB([dlog], [dlog_print],[],[AC_MSG_ERROR([You must install the dlog development package in order to compile lxc])])
+		AC_SUBST([DLOG_LIBS], [-ldlog])
+		])
+	])
+
+AC_ARG_ENABLE([memfd-rexec],
+	[AC_HELP_STRING([--enable-memfd-rexec], [enforce liblxc as a memfd to protect against certain symlink attacks [default=yes]])],
+	[], [enable_memfd_rexec=yes])
+AM_CONDITIONAL([ENFORCE_MEMFD_REXEC], [test "x$enable_memfd_rexec" = "xyes"])
+if test "x$enable_memfd_rexec" = "xyes"; then
+	AC_DEFINE([ENFORCE_MEMFD_REXEC], 1, [Rexec liblxc as memfd])
+	AC_MSG_RESULT([yes])
+else
+	AC_MSG_RESULT([no])
 fi
 
 # Files requiring some variable expansion
@@ -647,6 +774,7 @@ AC_CONFIG_FILES([
 
 	config/Makefile
 	config/apparmor/Makefile
+	config/apparmor/abstractions/start-container
 	config/selinux/Makefile
 	config/bash/Makefile
 	config/bash/lxc
@@ -866,6 +994,7 @@ Security features:
  - Linux capabilities: $enable_capabilities
  - seccomp: $enable_seccomp
  - SELinux: $enable_selinux
+ - memfd rexec: $enable_memfd_rexec
 
 PAM:
  - PAM module: $enable_pam
@@ -878,8 +1007,15 @@ Documentation:
 
 Debugging:
  - tests: $enable_tests
+ - ASAN: $enable_asan
  - mutex debugging: $enable_mutex_debugging
 
 Paths:
  - Logs in configpath: $enable_configpath_log
+
+Thread-safety:
+ - enforce: $enable_thread_safety
+
+Dlog:
+ - enable: $enable_dlog
 EOF

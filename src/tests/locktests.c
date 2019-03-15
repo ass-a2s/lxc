@@ -37,54 +37,65 @@ static void test_two_locks(void)
 	char c;
 
 	if (pipe(p) < 0)
-		exit(1);
+		exit(EXIT_FAILURE);
+
 	if ((pid = fork()) < 0)
-		exit(1);
+		exit(EXIT_FAILURE);
+
 	if (pid == 0) {
 		if (read(p[0], &c, 1) < 0) {
 			perror("read");
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
+
 		l = lxc_newlock("/tmp", "lxctest-sem");
 		if (!l) {
 			fprintf(stderr, "%d: child: failed to create lock\n", __LINE__);
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
+
 		if (lxclock(l, 0) < 0) {
 			fprintf(stderr, "%d: child: failed to grab lock\n", __LINE__);
-			exit(1);
+			exit(EXIT_FAILURE);
 		}
+
 		fprintf(stderr, "%d: child: grabbed lock\n", __LINE__);
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
+
 	l = lxc_newlock("/tmp", "lxctest-sem");
 	if (!l) {
 		fprintf(stderr, "%d: failed to create lock\n", __LINE__);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
+
 	if (lxclock(l, 0) < 0) {
 		fprintf(stderr, "%d; failed to get lock\n", __LINE__);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
+
 	if (write(p[1], "a", 1) < 0) {
 		perror("write");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
+
 	sleep(3);
+
 	ret = waitpid(pid, &status, WNOHANG);
 	if (ret == pid) { // task exited
 		if (WIFEXITED(status)) {
 			printf("%d exited normally with exit code %d\n", pid,
 				WEXITSTATUS(status));
-			if (WEXITSTATUS(status) == 0)
-				exit(1);
+			if (WEXITSTATUS(status) != 0)
+				exit(EXIT_FAILURE);
 		} else
 			printf("%d did not exit normally\n", pid);
 		return;
 	} else if (ret < 0) {
 		perror("waitpid");
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
+
 	kill(pid, SIGKILL);
 	wait(&status);
 	close(p[1]);
@@ -101,33 +112,36 @@ int main(int argc, char *argv[])
 	lock = lxc_newlock(NULL, NULL);
 	if (!lock) {
 		fprintf(stderr, "%d: failed to get unnamed lock\n", __LINE__);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
+
 	ret = lxclock(lock, 0);
 	if (ret) {
 		fprintf(stderr, "%d: failed to take unnamed lock (%d)\n", __LINE__, ret);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	ret = lxcunlock(lock);
 	if (ret) {
 		fprintf(stderr, "%d: failed to put unnamed lock (%d)\n", __LINE__, ret);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 	lxc_putlock(lock);
 
 	lock = lxc_newlock("/var/lib/lxc", mycontainername);
 	if (!lock) {
 		fprintf(stderr, "%d: failed to get lock\n", __LINE__);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
+
 	struct stat sb;
 	char *pathname = RUNTIME_PATH "/lxc/lock/var/lib/lxc/";
+
 	ret = stat(pathname, &sb);
 	if (ret != 0) {
 		fprintf(stderr, "%d: filename %s not created\n", __LINE__,
 			pathname);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 	lxc_putlock(lock);
 

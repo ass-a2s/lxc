@@ -20,20 +20,25 @@
  * License along with this library; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
-#include <sys/socket.h>
-#include <string.h>
-#include <stdio.h>
-#include <time.h>
-#include <unistd.h>
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <errno.h>
-#include <stdlib.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
+#include "config.h"
+#include "log.h"
 #include "nl.h"
 
-#define NLMSG_TAIL(nmsg) \
-        ((struct rtattr *) (((void *) (nmsg)) + NLMSG_ALIGN((nmsg)->nlmsg_len)))
+lxc_log_define(nl, lxc);
 
 extern size_t nlmsg_len(const struct nlmsg *nlmsg)
 {
@@ -61,7 +66,8 @@ static int nla_put(struct nlmsg *nlmsg, int attr,
 	rta = NLMSG_TAIL(nlmsg->nlmsghdr);
 	rta->rta_type = attr;
 	rta->rta_len = rtalen;
-	memcpy(RTA_DATA(rta), data, len);
+	if (data && len)
+		memcpy(RTA_DATA(rta), data, len);
 	nlmsg->nlmsghdr->nlmsg_len = tlen;
 	return 0;
 }
@@ -170,20 +176,20 @@ extern void nlmsg_free(struct nlmsg *nlmsg)
 	free(nlmsg);
 }
 
-extern int netlink_rcv(struct nl_handler *handler, struct nlmsg *answer)
+extern int __netlink_recv(struct nl_handler *handler, struct nlmsghdr *nlmsghdr)
 {
 	int ret;
 	struct sockaddr_nl nladdr;
 	struct iovec iov = {
-		.iov_base = answer->nlmsghdr,
-		.iov_len = answer->nlmsghdr->nlmsg_len,
+	    .iov_base = nlmsghdr,
+	    .iov_len = nlmsghdr->nlmsg_len,
 	};
 
 	struct msghdr msg = {
-		.msg_name = &nladdr,
-		.msg_namelen = sizeof(nladdr),
-		.msg_iov = &iov,
-		.msg_iovlen = 1,
+	    .msg_name = &nladdr,
+	    .msg_namelen = sizeof(nladdr),
+	    .msg_iov = &iov,
+	    .msg_iovlen = 1,
 	};
 
 	memset(&nladdr, 0, sizeof(nladdr));
@@ -196,68 +202,88 @@ again:
 	if (ret < 0) {
 		if (errno == EINTR)
 			goto again;
-		return -errno;
+
+		return -1;
 	}
 
 	if (!ret)
 		return 0;
 
-	if (msg.msg_flags & MSG_TRUNC &&
-	    ret == answer->nlmsghdr->nlmsg_len)
-		return -EMSGSIZE;
+	if (msg.msg_flags & MSG_TRUNC && (ret == nlmsghdr->nlmsg_len)) {
+		errno = EMSGSIZE;
+		ret = -1;
+	}
 
 	return ret;
 }
 
-extern int netlink_send(struct nl_handler *handler, struct nlmsg *nlmsg)
+extern int netlink_rcv(struct nl_handler *handler, struct nlmsg *answer)
 {
+	return __netlink_recv(handler, answer->nlmsghdr);
+}
+
+extern int __netlink_send(struct nl_handler *handler, struct nlmsghdr *nlmsghdr)
+{
+	int ret;
 	struct sockaddr_nl nladdr;
 	struct iovec iov = {
-		.iov_base = nlmsg->nlmsghdr,
-		.iov_len = nlmsg->nlmsghdr->nlmsg_len,
+	    .iov_base = nlmsghdr,
+	    .iov_len = nlmsghdr->nlmsg_len,
 	};
 	struct msghdr msg = {
-		.msg_name = &nladdr,
-		.msg_namelen = sizeof(nladdr),
-		.msg_iov = &iov,
-		.msg_iovlen = 1,
+	    .msg_name = &nladdr,
+	    .msg_namelen = sizeof(nladdr),
+	    .msg_iov = &iov,
+	    .msg_iovlen = 1,
 	};
-	int ret;
 
 	memset(&nladdr, 0, sizeof(nladdr));
 	nladdr.nl_family = AF_NETLINK;
 	nladdr.nl_pid = 0;
 	nladdr.nl_groups = 0;
 
-	ret = sendmsg(handler->fd, &msg, 0);
+	ret = sendmsg(handler->fd, &msg, MSG_NOSIGNAL);
 	if (ret < 0)
-		return -errno;
+		return -1;
 
 	return ret;
 }
 
-#ifndef NLMSG_ERROR
-#define NLMSG_ERROR                0x2
-#endif
-extern int netlink_transaction(struct nl_handler *handler,
-			       struct nlmsg *request, struct nlmsg *answer)
+extern int netlink_send(struct nl_handler *handler, struct nlmsg *nlmsg)
+{
+	return __netlink_send(handler, nlmsg->nlmsghdr);
+}
+
+extern int __netlink_transaction(struct nl_handler *handler,
+				 struct nlmsghdr *request,
+				 struct nlmsghdr *answer)
 {
 	int ret;
 
-	ret = netlink_send(handler, request);
+	ret = __netlink_send(handler, request);
 	if (ret < 0)
-		return ret;
+		return -1;
 
-	ret = netlink_rcv(handler, answer);
+	ret = __netlink_recv(handler, answer);
 	if (ret < 0)
-		return ret;
+		return -1;
 
-	if (answer->nlmsghdr->nlmsg_type == NLMSG_ERROR) {
-		struct nlmsgerr *err = (struct nlmsgerr*)NLMSG_DATA(answer->nlmsghdr);
-		return err->error;
+	ret = 0;
+	if (answer->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr *err = (struct nlmsgerr *)NLMSG_DATA(answer);
+		errno = -err->error;
+		if (err->error < 0)
+			ret = -1;
 	}
 
-	return 0;
+	return ret;
+}
+
+extern int netlink_transaction(struct nl_handler *handler,
+			       struct nlmsg *request, struct nlmsg *answer)
+{
+	return __netlink_transaction(handler, request->nlmsghdr,
+				     answer->nlmsghdr);
 }
 
 extern int netlink_open(struct nl_handler *handler, int protocol)
@@ -321,3 +347,22 @@ extern int netlink_close(struct nl_handler *handler)
 	return 0;
 }
 
+int addattr(struct nlmsghdr *n, size_t maxlen, int type, const void *data,
+	    size_t alen)
+{
+	int len = RTA_LENGTH(alen);
+	struct rtattr *rta;
+
+	errno = EMSGSIZE;
+	if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > maxlen)
+		return -1;
+
+	rta = NLMSG_TAIL(n);
+	rta->rta_type = type;
+	rta->rta_len = len;
+	if (alen)
+		memcpy(RTA_DATA(rta), data, alen);
+	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len);
+
+	return 0;
+}

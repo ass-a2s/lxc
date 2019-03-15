@@ -33,6 +33,10 @@
 #include "lxc.h"
 #include "commands.h"
 
+#ifndef HAVE_STRLCPY
+#include "include/strlcpy.h"
+#endif
+
 #define MYNAME "lxctest1"
 
 #define TSTERR(fmt, ...) do { \
@@ -53,8 +57,9 @@ static int test_running_container(const char *lxcpath,
 	char *cgrelpath;
 	char  relpath[PATH_MAX+1];
 	char  value[NAME_MAX], value_save[NAME_MAX];
+	struct cgroup_ops *cgroup_ops;
 
-	sprintf(relpath, "%s/%s", group ? group : "lxc", name);
+	sprintf(relpath, "%s/%s", group ? group : "lxc.payload", name);
 
 	if ((c = lxc_container_new(name, lxcpath)) == NULL) {
 		TSTERR("container %s couldn't instantiate", name);
@@ -75,36 +80,41 @@ static int test_running_container(const char *lxcpath,
 		goto err3;
 	}
 
-	/* test get/set value using memory.soft_limit_in_bytes file */
-	ret = lxc_cgroup_get("memory.soft_limit_in_bytes", value, sizeof(value),
-			     c->name, c->config_path);
-	if (ret < 0) {
-		TSTERR("lxc_cgroup_get failed");
+	cgroup_ops = cgroup_init(c->lxc_conf);
+	if (!cgroup_ops)
 		goto err3;
-	}
-	strcpy(value_save, value);
 
-	ret = lxc_cgroup_set("memory.soft_limit_in_bytes", "512M", c->name, c->config_path);
+	/* test get/set value using memory.soft_limit_in_bytes file */
+	ret = cgroup_ops->get(cgroup_ops, "memory.soft_limit_in_bytes", value,
+			      sizeof(value), c->name, c->config_path);
 	if (ret < 0) {
-		TSTERR("lxc_cgroup_set failed %d %d", ret, errno);
+		TSTERR("cgroup_get failed");
 		goto err3;
 	}
-	ret = lxc_cgroup_get("memory.soft_limit_in_bytes", value, sizeof(value),
-			     c->name, c->config_path);
+	(void)strlcpy(value_save, value, NAME_MAX);
+
+	ret = cgroup_ops->set(cgroup_ops, "memory.soft_limit_in_bytes", "512M",
+			      c->name, c->config_path);
 	if (ret < 0) {
-		TSTERR("lxc_cgroup_get failed");
+		TSTERR("cgroup_set failed %d %d", ret, errno);
+		goto err3;
+	}
+	ret = cgroup_ops->get(cgroup_ops, "memory.soft_limit_in_bytes", value,
+			      sizeof(value), c->name, c->config_path);
+	if (ret < 0) {
+		TSTERR("cgroup_get failed");
 		goto err3;
 	}
 	if (strcmp(value, "536870912\n")) {
-		TSTERR("lxc_cgroup_set_bypath failed to set value >%s<", value);
+		TSTERR("cgroup_set_bypath failed to set value >%s<", value);
 		goto err3;
 	}
 
 	/* restore original value */
-	ret = lxc_cgroup_set("memory.soft_limit_in_bytes", value_save,
-			     c->name, c->config_path);
+	ret = cgroup_ops->set(cgroup_ops, "memory.soft_limit_in_bytes",
+			      value_save, c->name, c->config_path);
 	if (ret < 0) {
-		TSTERR("lxc_cgroup_set failed");
+		TSTERR("cgroup_set failed");
 		goto err3;
 	}
 
@@ -174,7 +184,7 @@ int main()
 	 * pam_cgroup */
 	if (geteuid() != 0) {
 		TSTERR("requires privilege");
-		exit(0);
+		exit(EXIT_SUCCESS);
 	}
 
 	#if TEST_ALREADY_RUNNING_CT

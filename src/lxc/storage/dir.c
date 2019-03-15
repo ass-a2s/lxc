@@ -21,10 +21,13 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <stdint.h>
 #include <string.h>
 
+#include "config.h"
 #include "log.h"
 #include "storage.h"
 #include "utils.h"
@@ -157,7 +160,7 @@ bool dir_detect(const char *path)
 int dir_mount(struct lxc_storage *bdev)
 {
 	int ret;
-	unsigned long mflags, mntflags;
+	unsigned long mflags = 0, mntflags = 0, pflags = 0;
 	char *mntdata;
 	const char *src;
 
@@ -171,17 +174,23 @@ int dir_mount(struct lxc_storage *bdev)
 	if (ret < 0) {
 		ERROR("Failed to parse mount options \"%s\"", bdev->mntopts);
 		free(mntdata);
-		return -22;
+		return -EINVAL;
+	}
+
+	ret = parse_propagationopts(bdev->mntopts, &pflags);
+	if (ret < 0) {
+		ERROR("Failed to parse propagation options \"%s\"", bdev->mntopts);
+		free(mntdata);
+		return -EINVAL;
 	}
 
 	src = lxc_storage_get_path(bdev->src, bdev->type);
 
-	ret = mount(src, bdev->dest, "bind", MS_BIND | MS_REC | mntflags,
-		    mntdata);
+	ret = mount(src, bdev->dest, "bind", MS_BIND | MS_REC | mntflags | pflags, mntdata);
 	if ((0 == ret) && (mntflags & MS_RDONLY)) {
 		DEBUG("Remounting \"%s\" on \"%s\" readonly",
 		      src ? src : "(none)", bdev->dest ? bdev->dest : "(none)");
-		mflags = add_required_remount_flags(src, bdev->dest, MS_BIND | MS_REC | mntflags | MS_REMOUNT);
+		mflags = add_required_remount_flags(src, bdev->dest, MS_BIND | MS_REC | mntflags | pflags | MS_REMOUNT);
 		ret = mount(src, bdev->dest, "bind", mflags, mntdata);
 	}
 

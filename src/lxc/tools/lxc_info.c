@@ -21,20 +21,26 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <libgen.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <lxc/lxccontainer.h>
 
 #include "arguments.h"
-#include "tool_utils.h"
+#include "config.h"
+#include "log.h"
+#include "utils.h"
+
+lxc_log_define(lxc_info, lxc);
 
 static bool ips;
 static bool state;
@@ -42,20 +48,22 @@ static bool pid;
 static bool stats;
 static bool humanize = true;
 static char **key = NULL;
-static int keys = 0;
+static int nr_keys = 0;
 static int filter_count = 0;
 
-static int my_parser(struct lxc_arguments* args, int c, char* arg)
+static int my_parser(struct lxc_arguments *args, int c, char *arg)
 {
 	char **newk;
+
 	switch (c) {
 	case 'c':
-		newk = realloc(key, (keys + 1) * sizeof(key[0]));
+		newk = realloc(key, (nr_keys + 1) * sizeof(key[0]));
 		if (!newk)
 			return -1;
+
 		key = newk;
-		key[keys] = arg;
-		keys++;
+		key[nr_keys] = arg;
+		nr_keys++;
 		break;
 	case 'i': ips = true; filter_count += 1; break;
 	case 's': state = true; filter_count += 1; break;
@@ -112,19 +120,19 @@ static void str_chomp(char *buf)
 static void size_humanize(unsigned long long val, char *buf, size_t bufsz)
 {
 	if (val > 1 << 30) {
-		snprintf(buf, bufsz, "%u.%2.2u GiB",
-			    (unsigned int)(val >> 30),
-			    (unsigned int)(val & ((1 << 30) - 1)) / 10737419);
+		(void)snprintf(buf, bufsz, "%u.%2.2u GiB",
+			       (unsigned int)(val >> 30),
+			       (unsigned int)(val & ((1 << 30) - 1)) / 10737419);
 	} else if (val > 1 << 20) {
 		unsigned int x = val + 5243;  /* for rounding */
-		snprintf(buf, bufsz, "%u.%2.2u MiB",
-			    x >> 20, ((x & ((1 << 20) - 1)) * 100) >> 20);
+		(void)snprintf(buf, bufsz, "%u.%2.2u MiB", x >> 20,
+			       ((x & ((1 << 20) - 1)) * 100) >> 20);
 	} else if (val > 1 << 10) {
 		unsigned int x = val + 5;  /* for rounding */
-		snprintf(buf, bufsz, "%u.%2.2u KiB",
-			    x >> 10, ((x & ((1 << 10) - 1)) * 100) >> 10);
+		(void)snprintf(buf, bufsz, "%u.%2.2u KiB", x >> 10,
+			       ((x & ((1 << 10) - 1)) * 100) >> 10);
 	} else {
-		snprintf(buf, bufsz, "%u bytes", (unsigned int)val);
+		(void)snprintf(buf, bufsz, "%u bytes", (unsigned int)val);
 	}
 }
 
@@ -153,6 +161,7 @@ static void print_net_stats(struct lxc_container *c)
 
 	for(netnr = 0; ;netnr++) {
 		sprintf(buf, "lxc.net.%d.type", netnr);
+
 		type = c->get_running_config_item(c, buf);
 		if (!type)
 			break;
@@ -163,27 +172,37 @@ static void print_net_stats(struct lxc_container *c)
 			sprintf(buf, "lxc.net.%d.link", netnr);
 		}
 		free(type);
+
 		ifname = c->get_running_config_item(c, buf);
 		if (!ifname)
 			return;
+
 		printf("%-15s %s\n", "Link:", ifname);
 		fflush(stdout);
 
 		/* XXX: tx and rx are reversed from the host vs container
 		 * perspective, print them from the container perspective
 		 */
-		snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/rx_bytes", ifname);
+		rc = snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/rx_bytes", ifname);
+		if (rc < 0 || (size_t)rc >= sizeof(path))
+			return;
+
 		rc = lxc_read_from_file(path, buf, sizeof(buf));
 		if (rc > 0) {
+			buf[rc - 1] = '\0';
 			str_chomp(buf);
 			rx_bytes = str_size_humanize(buf, sizeof(buf));
 			printf("%-15s %s\n", " TX bytes:", buf);
 			fflush(stdout);
 		}
 
-		snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/tx_bytes", ifname);
+		rc = snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/tx_bytes", ifname);
+		if (rc < 0 || (size_t)rc >= sizeof(path))
+			return;
+
 		rc = lxc_read_from_file(path, buf, sizeof(buf));
 		if (rc > 0) {
+			buf[rc - 1] = '\0';
 			str_chomp(buf);
 			tx_bytes = str_size_humanize(buf, sizeof(buf));
 			printf("%-15s %s\n", " RX bytes:", buf);
@@ -255,28 +274,28 @@ static void print_stats(struct lxc_container *c)
 	}
 }
 
-static void print_info_msg_int(const char *key, int value)
+static void print_info_msg_int(const char *k, int value)
 {
 	if (humanize)
-		printf("%-15s %d\n", key, value);
+		printf("%-15s %d\n", k, value);
 	else {
 		if (filter_count == 1)
 			printf("%d\n", value);
 		else
-			printf("%-15s %d\n", key, value);
+			printf("%-15s %d\n", k, value);
 	}
 	fflush(stdout);
 }
 
-static void print_info_msg_str(const char *key, const char *value)
+static void print_info_msg_str(const char *k, const char *value)
 {
 	if (humanize)
-		printf("%-15s %s\n", key, value);
+		printf("%-15s %s\n", k, value);
 	else {
 		if (filter_count == 1)
 			printf("%s\n", value);
 		else
-			printf("%-15s %s\n", key, value);
+			printf("%-15s %s\n", k, value);
 	}
 	fflush(stdout);
 }
@@ -295,11 +314,13 @@ static int print_info(const char *name, const char *lxcpath)
 
 	if (my_args.rcfile) {
 		c->clear_config(c);
+
 		if (!c->load_config(c, my_args.rcfile)) {
 			fprintf(stderr, "Failed to load rcfile\n");
 			lxc_container_put(c);
 			return -1;
 		}
+
 		c->configfile = strdup(my_args.rcfile);
 		if (!c->configfile) {
 			fprintf(stderr, "Out of memory setting new config filename\n");
@@ -320,14 +341,13 @@ static int print_info(const char *name, const char *lxcpath)
 		return -1;
 	}
 
-	if (!state && !pid && !ips && !stats && keys <= 0) {
+	if (!state && !pid && !ips && !stats && nr_keys <= 0) {
 		state = pid = ips = stats = true;
 		print_info_msg_str("Name:", c->name);
 	}
 
-	if (state) {
+	if (state)
 		print_info_msg_str("State:", c->state(c));
-	}
 
 	if (c->is_running(c)) {
 		if (pid) {
@@ -340,10 +360,12 @@ static int print_info(const char *name, const char *lxcpath)
 
 		if (ips) {
 			fflush(stdout);
+
 			char **addresses = c->get_ips(c, NULL, NULL, 0);
 			if (addresses) {
 				char *address;
 				i = 0;
+
 				while (addresses[i]) {
 					address = addresses[i];
 					print_info_msg_str("IP:", address);
@@ -358,7 +380,7 @@ static int print_info(const char *name, const char *lxcpath)
 		print_net_stats(c);
 	}
 
-	for(i = 0; i < keys; i++) {
+	for(i = 0; i < nr_keys; i++) {
 		int len = c->get_config_item(c, key[i], NULL, 0);
 
 		if (len > 0) {
@@ -367,14 +389,15 @@ static int print_info(const char *name, const char *lxcpath)
 			if (c->get_config_item(c, key[i], val, len + 1) != len) {
 				fprintf(stderr, "unable to read %s from configuration\n", key[i]);
 			} else {
-				if (!humanize && keys == 1)
+				if (!humanize && nr_keys == 1)
 					printf("%s\n", val);
 				else
 					printf("%s = %s\n", key[i], val);
 			}
+
 			free(val);
 		} else if (len == 0) {
-			if (!humanize && keys == 1)
+			if (!humanize && nr_keys == 1)
 				printf("\n");
 			else
 				printf("%s =\n", key[i]);
@@ -396,18 +419,18 @@ int main(int argc, char *argv[])
 	if (lxc_arguments_parse(&my_args, argc, argv))
 		exit(ret);
 
-	if (!my_args.log_file)
-		my_args.log_file = "none";
+	/* Only create log if explicitly instructed */
+	if (my_args.log_file || my_args.log_priority) {
+		log.name = my_args.name;
+		log.file = my_args.log_file;
+		log.level = my_args.log_priority;
+		log.prefix = my_args.progname;
+		log.quiet = my_args.quiet;
+		log.lxcpath = my_args.lxcpath[0];
 
-	log.name = my_args.name;
-	log.file = my_args.log_file;
-	log.level = my_args.log_priority;
-	log.prefix = my_args.progname;
-	log.quiet = my_args.quiet;
-	log.lxcpath = my_args.lxcpath[0];
-
-	if (lxc_log_init(&log))
-		exit(ret);
+		if (lxc_log_init(&log))
+			exit(ret);
+	}
 
 	if (print_info(my_args.name, my_args.lxcpath[0]) == 0)
 		ret = EXIT_SUCCESS;

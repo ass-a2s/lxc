@@ -18,10 +18,15 @@
  *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <stdio.h>
 #include <string.h>
 
 #include <lxc/lxccontainer.h>
+
+#include "config.h"
 
 struct lxc_config_items {
 	char *name;
@@ -52,6 +57,7 @@ static void list_config_items(void)
 
 	for (i = &items[0]; i->name; i++)
 		printf("%s\n", i->name);
+
 	exit(EXIT_SUCCESS);
 }
 
@@ -60,21 +66,25 @@ int main(int argc, char *argv[])
 	struct lxc_config_items *i;
 	const char *value;
 
-	if (argc < 2 || strcmp(argv[1], "-h") == 0 ||
-			strcmp(argv[1], "--help") == 0)
+	if (argc < 2 || strncmp(argv[1], "-h", strlen(argv[1])) == 0 ||
+	                strncmp(argv[1], "--help", strlen(argv[1])) == 0)
 		usage(argv[0]);
-	if (strcmp(argv[1], "-l") == 0)
+
+	if (strncmp(argv[1], "-l", strlen(argv[1])) == 0)
 		list_config_items();
+
 	for (i = &items[0]; i->name; i++) {
-		if (strcmp(argv[1], i->name) == 0) {
+		if (strncmp(argv[1], i->name, strlen(argv[1])) == 0) {
 			value = lxc_get_global_config_item(i->name);
 			if (value)
 				printf("%s\n", value);
 			else
 				printf("%s is not set.\n", argv[1]);
+
 			exit(EXIT_SUCCESS);
 		}
 	}
+
 	printf("Unknown configuration item: %s\n", argv[1]);
 	exit(EXIT_FAILURE);
 }

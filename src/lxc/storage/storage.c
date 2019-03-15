@@ -21,7 +21,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -32,12 +34,12 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <unistd.h>
 #include <sys/mount.h>
 #include <sys/prctl.h>
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "btrfs.h"
 #include "conf.h"
@@ -49,8 +51,9 @@
 #include "lvm.h"
 #include "lxc.h"
 #include "lxclock.h"
-#include "nbd.h"
+#include "memory_utils.h"
 #include "namespace.h"
+#include "nbd.h"
 #include "overlay.h"
 #include "parse.h"
 #include "rbd.h"
@@ -59,6 +62,10 @@
 #include "storage_utils.h"
 #include "utils.h"
 #include "zfs.h"
+
+#ifndef HAVE_STRLCPY
+#include "include/strlcpy.h"
+#endif
 
 #ifndef BLKGETSIZE64
 #define BLKGETSIZE64 _IOR(0x12, 114, size_t)
@@ -308,7 +315,7 @@ bool storage_can_backup(struct lxc_conf *conf)
 	return ret;
 }
 
-/* If we're not snaphotting, then storage_copy becomes a simple case of mount
+/* If we're not snapshotting, then storage_copy becomes a simple case of mount
  * the original, mount the new, and rsync the contents.
  */
 struct lxc_storage *storage_copy(struct lxc_container *c, const char *cname,
@@ -325,7 +332,7 @@ struct lxc_storage *storage_copy(struct lxc_container *c, const char *cname,
 	const char *src = c->lxc_conf->rootfs.path;
 	const char *oldname = c->name;
 	const char *oldpath = c->config_path;
-	char cmd_output[MAXPATHLEN] = {0};
+	char cmd_output[PATH_MAX] = {0};
 	struct rsync_data data = {0};
 
 	if (!src) {
@@ -349,7 +356,6 @@ struct lxc_storage *storage_copy(struct lxc_container *c, const char *cname,
 	}
 
 	if (!orig->dest) {
-		int ret;
 		size_t len;
 		struct stat sb;
 
@@ -562,13 +568,11 @@ struct lxc_storage *storage_create(const char *dest, const char *type,
 
 	/* -B lvm,dir */
 	if (strchr(type, ',')) {
-		char *dup, *token;
-		char *saveptr = NULL;
+		__do_free char *dup = NULL;
+		char *token;
 
-		dup = alloca(strlen(type) + 1);
-		strcpy(dup, type);
-		for (token = strtok_r(dup, ",", &saveptr); token;
-		     token = strtok_r(NULL, ",", &saveptr)) {
+		dup = must_copy_string(type);
+		lxc_iterate_parts(token, dup, ",") {
 			bdev = do_storage_create(dest, token, cname, specs);
 			if (bdev)
 				return bdev;

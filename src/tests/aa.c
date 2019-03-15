@@ -57,7 +57,7 @@ static int test_attach_write_file(void* payload)
 
 /*
  * try opening a file attached to a container.  Return 0 on open fail.  Return
- * 1 if the file open succeeded.  Return -1 if attach itself failed - perhas an
+ * 1 if the file open succeeded.  Return -1 if attach itself failed - perhaps an
  * older kernel.
  */
 static int do_test_file_open(struct lxc_container *c, char *fnam)
@@ -94,7 +94,7 @@ static int do_test_file_open(struct lxc_container *c, char *fnam)
 		fret = 0;
 
 err2:
-	wait_for_pid(pid);
+	(void)wait_for_pid(pid);
 err1:
 	close(pipefd[0]);
 	close(pipefd[1]);
@@ -154,7 +154,7 @@ int main(int argc, char *argv[])
 	c = lxc_container_new(MYNAME, NULL);
 	if (!c) {
 		fprintf(stderr, "%s: %d: failed to load first container\n", __FILE__, __LINE__);
-		exit(1);
+		exit(EXIT_FAILURE);
 	}
 
 	if (c->is_defined(c)) {
@@ -190,9 +190,9 @@ int main(int argc, char *argv[])
 	c->stop(c);
 
 	try_to_remove();
-	exit(0);
+	exit(EXIT_SUCCESS);
 
 err:
 	try_to_remove();
-	exit(1);
+	exit(EXIT_FAILURE);
 }

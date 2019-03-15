@@ -21,7 +21,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
 #define __STDC_FORMAT_MACROS /* Required for PRIu64 to work. */
 #include <inttypes.h>	/* Required for PRIu64 to work. */
 #include <stdint.h>
@@ -29,10 +31,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "config.h"
 #include "log.h"
+#include "memory_utils.h"
 #include "storage.h"
 #include "storage_utils.h"
 #include "utils.h"
+
+#ifndef HAVE_STRLCPY
+#include "include/strlcpy.h"
+#endif
 
 lxc_log_define(rbd, lxc);
 
@@ -97,7 +105,7 @@ int rbd_create(struct lxc_storage *bdev, const char *dest, const char *n,
 	int ret, len;
 	char sz[24];
 	const char *cmd_args[2];
-	char cmd_output[MAXPATHLEN];
+	char cmd_output[PATH_MAX];
 	const char *rbdname = n;
 	struct rbd_args args = {0};
 
@@ -188,11 +196,12 @@ int rbd_create(struct lxc_storage *bdev, const char *dest, const char *n,
 
 int rbd_destroy(struct lxc_storage *orig)
 {
+	__do_free char *rbdfullname = NULL;
 	int ret;
 	const char *src;
-	char *rbdfullname;
-	char cmd_output[MAXPATHLEN];
+	char cmd_output[PATH_MAX];
 	struct rbd_args args = {0};
+	size_t len;
 
 	src = lxc_storage_get_path(orig->src, orig->type);
 	if (file_exists(src)) {
@@ -206,9 +215,11 @@ int rbd_destroy(struct lxc_storage *orig)
 		}
 	}
 
-	rbdfullname = alloca(strlen(src) - 8);
-	strcpy(rbdfullname, &src[9]);
+	len = strlen(src);
+	rbdfullname = must_realloc(NULL, len - 8);
+	(void)strlcpy(rbdfullname, &src[9], len - 8);
 	args.rbd_name = rbdfullname;
+
 	ret = run_command(cmd_output, sizeof(cmd_output),
 			rbd_delete_wrapper, (void *)&args);
 	if (ret < 0) {

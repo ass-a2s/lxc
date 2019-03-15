@@ -21,61 +21,86 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#define _GNU_SOURCE
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
 #include <net/if.h>
+#include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
 #include <sys/param.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/utsname.h>
+#include <unistd.h>
 
 #include <lxc/lxccontainer.h>
 
 #include "arguments.h"
-#include "tool_list.h"
-#include "tool_utils.h"
+#include "caps.h"
+#include "config.h"
+#include "confile.h"
+#include "log.h"
+
+lxc_log_define(lxc_start, lxc);
+
+static int my_parser(struct lxc_arguments *args, int c, char *arg);
+static int ensure_path(char **confpath, const char *path);
 
 static struct lxc_list defines;
 
-static int ensure_path(char **confpath, const char *path)
-{
-	int err = -1, fd;
-	char *fullpath = NULL;
+static const struct option my_longopts[] = {
+	{"daemon", no_argument, 0, 'd'},
+	{"foreground", no_argument, 0, 'F'},
+	{"rcfile", required_argument, 0, 'f'},
+	{"define", required_argument, 0, 's'},
+	{"console", required_argument, 0, 'c'},
+	{"console-log", required_argument, 0, 'L'},
+	{"close-all-fds", no_argument, 0, 'C'},
+	{"pidfile", required_argument, 0, 'p'},
+	{"share-net", required_argument, 0, OPT_SHARE_NET},
+	{"share-ipc", required_argument, 0, OPT_SHARE_IPC},
+	{"share-uts", required_argument, 0, OPT_SHARE_UTS},
+	{"share-pid", required_argument, 0, OPT_SHARE_PID},
+	LXC_COMMON_OPTIONS
+};
 
-	if (path) {
-		if (access(path, W_OK)) {
-			fd = creat(path, 0600);
-			if (fd < 0 && errno != EEXIST) {
-				fprintf(stderr, "failed to create '%s'\n", path);
-				goto err;
-			}
-			if (fd >= 0)
-				close(fd);
-		}
-
-		fullpath = realpath(path, NULL);
-		if (!fullpath) {
-			fprintf(stderr, "failed to get the real path of '%s'\n", path);
-			goto err;
-		}
-
-		*confpath = fullpath;
-	}
-	err = EXIT_SUCCESS;
-
-err:
-	return err;
-}
+static struct lxc_arguments my_args = {
+	.progname     = "lxc-start",
+	.help         = "\
+--name=NAME -- COMMAND\n\
+\n\
+lxc-start start COMMAND in specified container NAME\n\
+\n\
+Options :\n\
+  -n, --name=NAME        NAME of the container\n\
+  -d, --daemon           Daemonize the container (default)\n\
+  -F, --foreground       Start with the current tty attached to /dev/console\n\
+  -p, --pidfile=FILE     Create a file with the process id\n\
+  -f, --rcfile=FILE      Load configuration file FILE\n\
+  -c, --console=FILE     Use specified FILE for the container console\n\
+  -L, --console-log=FILE Log container console output to FILE\n\
+  -C, --close-all-fds    If any fds are inherited, close them\n\
+                         If not specified, exit with failure instead\n\
+                         Note: --daemon implies --close-all-fds\n\
+  -s, --define KEY=VAL   Assign VAL to configuration variable KEY\n\
+      --share-[net|ipc|uts|pid]=NAME Share a namespace with another container or pid\n\
+",
+	.options      = my_longopts,
+	.parser       = my_parser,
+	.checker      = NULL,
+	.log_priority = "ERROR",
+	.log_file     = "none",
+	.daemonize    = 1,
+	.pidfile      = NULL,
+};
 
 static int my_parser(struct lxc_arguments *args, int c, char *arg)
 {
@@ -96,7 +121,7 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
 		args->rcfile = arg;
 		break;
 	case 'C':
-		args->close_all_fds = 1;
+		args->close_all_fds = true;
 		break;
 	case 's':
 		return lxc_config_define_add(&defines, arg);
@@ -119,49 +144,34 @@ static int my_parser(struct lxc_arguments *args, int c, char *arg)
 	return 0;
 }
 
-static const struct option my_longopts[] = {
-	{"daemon", no_argument, 0, 'd'},
-	{"foreground", no_argument, 0, 'F'},
-	{"rcfile", required_argument, 0, 'f'},
-	{"define", required_argument, 0, 's'},
-	{"console", required_argument, 0, 'c'},
-	{"console-log", required_argument, 0, 'L'},
-	{"close-all-fds", no_argument, 0, 'C'},
-	{"pidfile", required_argument, 0, 'p'},
-	{"share-net", required_argument, 0, OPT_SHARE_NET},
-	{"share-ipc", required_argument, 0, OPT_SHARE_IPC},
-	{"share-uts", required_argument, 0, OPT_SHARE_UTS},
-	{"share-pid", required_argument, 0, OPT_SHARE_PID},
-	LXC_COMMON_OPTIONS
-};
+static int ensure_path(char **confpath, const char *path)
+{
+	int fd;
+	char *fullpath = NULL;
 
-static struct lxc_arguments my_args = {
-	.progname = "lxc-start",
-	.help     = "\
---name=NAME -- COMMAND\n\
-\n\
-lxc-start start COMMAND in specified container NAME\n\
-\n\
-Options :\n\
-  -n, --name=NAME        NAME of the container\n\
-  -d, --daemon           Daemonize the container (default)\n\
-  -F, --foreground       Start with the current tty attached to /dev/console\n\
-  -p, --pidfile=FILE     Create a file with the process id\n\
-  -f, --rcfile=FILE      Load configuration file FILE\n\
-  -c, --console=FILE     Use specified FILE for the container console\n\
-  -L, --console-log=FILE Log container console output to FILE\n\
-  -C, --close-all-fds    If any fds are inherited, close them\n\
-                         If not specified, exit with failure instead\n\
-                         Note: --daemon implies --close-all-fds\n\
-  -s, --define KEY=VAL   Assign VAL to configuration variable KEY\n\
-      --share-[net|ipc|uts|pid]=NAME Share a namespace with another container or pid\n\
-",
-	.options   = my_longopts,
-	.parser    = my_parser,
-	.checker   = NULL,
-	.daemonize = 1,
-	.pidfile = NULL,
-};
+	if (path) {
+		if (access(path, W_OK)) {
+			fd = creat(path, 0600);
+			if (fd < 0 && errno != EEXIST) {
+				ERROR("Failed to create '%s'", path);
+				return -1;
+			}
+
+			if (fd >= 0)
+				close(fd);
+		}
+
+		fullpath = realpath(path, NULL);
+		if (!fullpath) {
+			ERROR("Failed to get the real path of '%s'", path);
+			return -1;
+		}
+
+		*confpath = fullpath;
+	}
+
+	return 0;
+}
 
 int main(int argc, char *argv[])
 {
@@ -201,8 +211,7 @@ int main(int argc, char *argv[])
 
 	lxcpath = my_args.lxcpath[0];
 	if (access(lxcpath, O_RDONLY) < 0) {
-		if (!my_args.quiet)
-			fprintf(stderr, "You lack access to %s\n", lxcpath);
+		ERROR("You lack access to %s", lxcpath);
 		exit(err);
 	}
 
@@ -215,20 +224,24 @@ int main(int argc, char *argv[])
 	/* rcfile is specified in the cli option */
 	if (my_args.rcfile) {
 		rcfile = (char *)my_args.rcfile;
+
 		c = lxc_container_new(my_args.name, lxcpath);
 		if (!c) {
-			fprintf(stderr, "Failed to create lxc_container\n");
+			ERROR("Failed to create lxc_container");
 			exit(err);
 		}
+
 		c->clear_config(c);
+
 		if (!c->load_config(c, rcfile)) {
-			fprintf(stderr, "Failed to load rcfile\n");
+			ERROR("Failed to load rcfile");
 			lxc_container_put(c);
 			exit(err);
 		}
+
 		c->configfile = strdup(my_args.rcfile);
 		if (!c->configfile) {
-			fprintf(stderr, "Out of memory setting new config filename\n");
+			ERROR("Out of memory setting new config filename");
 			goto out;
 		}
 	} else {
@@ -236,7 +249,7 @@ int main(int argc, char *argv[])
 
 		rc = asprintf(&rcfile, "%s/%s/config", lxcpath, my_args.name);
 		if (rc == -1) {
-			fprintf(stderr, "failed to allocate memory\n");
+			ERROR("Failed to allocate memory");
 			exit(err);
 		}
 
@@ -245,9 +258,10 @@ int main(int argc, char *argv[])
 			free(rcfile);
 			rcfile = NULL;
 		}
+
 		c = lxc_container_new(my_args.name, lxcpath);
 		if (!c) {
-			fprintf(stderr, "Failed to create lxc_container\n");
+			ERROR("Failed to create lxc_container");
 			exit(err);
 		}
 	}
@@ -257,23 +271,23 @@ int main(int argc, char *argv[])
 	 * to be created for it to be started. You can just pass a configuration
 	 * file as argument and start the container right away.
 	 */
-
 	if (!c->may_control(c)) {
-		fprintf(stderr, "Insufficent privileges to control %s\n", c->name);
+		ERROR("Insufficent privileges to control %s", c->name);
 		goto out;
 	}
 
 	if (c->is_running(c)) {
-		fprintf(stderr, "Container is already running.\n");
+		ERROR("Container is already running");
 		err = EXIT_SUCCESS;
 		goto out;
 	}
+
 	/*
 	 * We should use set_config_item() over &defines, which would handle
 	 * unset c->lxc_conf for us and let us not use lxc_config_define_load()
 	 */
 	if (!c->lxc_conf) {
-		fprintf(stderr, "No container config specified\n");
+		ERROR("No container config specified");
 		goto out;
 	}
 
@@ -281,16 +295,15 @@ int main(int argc, char *argv[])
 		goto out;
 
 	if (!rcfile && !strcmp("/sbin/init", args[0])) {
-		fprintf(stderr, "Executing '/sbin/init' with no configuration file may crash the host\n");
+		ERROR("Executing '/sbin/init' with no configuration file may crash the host");
 		goto out;
 	}
 
-	if (my_args.pidfile != NULL) {
+	if (my_args.pidfile)
 		if (ensure_path(&c->pidfile, my_args.pidfile) < 0) {
-			fprintf(stderr, "failed to ensure pidfile '%s'\n", my_args.pidfile);
+			ERROR("Failed to ensure pidfile '%s'", my_args.pidfile);
 			goto out;
 		}
-	}
 
 	if (my_args.console)
 		if (!c->set_config_item(c, "lxc.console.path", my_args.console))
@@ -303,9 +316,8 @@ int main(int argc, char *argv[])
 	if (!lxc_setup_shared_ns(&my_args, c))
 		goto out;
 
-	if (!my_args.daemonize) {
+	if (!my_args.daemonize)
 		c->want_daemonize(c, false);
-	}
 
 	if (my_args.close_all_fds)
 		c->want_close_all_fds(c, true);
@@ -314,13 +326,15 @@ int main(int argc, char *argv[])
 		err = c->start(c, 0, NULL) ? EXIT_SUCCESS : EXIT_FAILURE;
 	else
 		err = c->start(c, 0, args) ? EXIT_SUCCESS : EXIT_FAILURE;
-
 	if (err) {
-		fprintf(stderr, "The container failed to start.\n");
+		ERROR("The container failed to start");
+
 		if (my_args.daemonize)
-			fprintf(stderr, "To get more details, run the container in foreground mode.\n");
-		fprintf(stderr, "Additional information can be obtained by setting the "
-		      "--logfile and --logpriority options.\n");
+			ERROR("To get more details, run the container in foreground mode");
+
+		ERROR("Additional information can be obtained by setting the "
+		      "--logfile and --logpriority options");
+
 		err = c->error_num;
 		lxc_container_put(c);
 		exit(err);

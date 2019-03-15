@@ -24,18 +24,15 @@
 #ifndef __LXC_STORAGE_UTILS_H
 #define __LXC_STORAGE_UTILS_H
 
-#include "config.h"
-#include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "conf.h"
 
 struct lxc_storage;
 struct lxc_conf;
 
-extern char *dir_new_path(char *src, const char *oldname, const char *name,
-			  const char *oldpath, const char *lxcpath);
 extern bool attach_block_device(struct lxc_conf *conf);
 extern void detach_block_device(struct lxc_conf *conf);
 extern int blk_getsize(struct lxc_storage *bdev, uint64_t *size);
@@ -48,6 +45,7 @@ extern int find_fstype_cb(char *buffer, void *data);
 extern const char *linkderef(const char *path, char *dest);
 extern bool unpriv_snap_allowed(struct lxc_storage *b, const char *t, bool snap,
 				bool maybesnap);
+extern uint64_t get_fssize(char *s);
 extern bool is_valid_storage_type(const char *type);
 extern int storage_destroy_wrapper(void *data);
 

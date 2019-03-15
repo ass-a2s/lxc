@@ -23,6 +23,8 @@
 #ifndef __LXC_NL_H
 #define __LXC_NL_H
 
+#include <stdio.h>
+
 /*
  * Use this as a good size to allocate generic netlink messages
  */
@@ -98,6 +100,7 @@ int netlink_close(struct nl_handler *handler);
  * Returns 0 on success, < 0 otherwise
  */
 int netlink_rcv(struct nl_handler *handler, struct nlmsg *nlmsg);
+int __netlink_recv(struct nl_handler *handler, struct nlmsghdr *nlmsg);
 
 /*
  * netlink_send: send a netlink message to the kernel. It is up
@@ -109,6 +112,7 @@ int netlink_rcv(struct nl_handler *handler, struct nlmsg *nlmsg);
  * Returns 0 on success, < 0 otherwise
  */
 int netlink_send(struct nl_handler *handler, struct nlmsg *nlmsg);
+int __netlink_send(struct nl_handler *handler, struct nlmsghdr *nlmsg);
 
 /*
  * netlink_transaction: send a request to the kernel and read the response.
@@ -122,7 +126,9 @@ int netlink_send(struct nl_handler *handler, struct nlmsg *nlmsg);
  * Returns 0 on success, < 0 otherwise
  */
 int netlink_transaction(struct nl_handler *handler,
-			struct nlmsg *request, struct nlmsg *anwser);
+			struct nlmsg *request, struct nlmsg *answer);
+int __netlink_transaction(struct nl_handler *handler, struct nlmsghdr *request,
+			  struct nlmsghdr *answer);
 
 /*
  * nla_put_string: copy a null terminated string to a netlink message
@@ -255,5 +261,7 @@ void nlmsg_free(struct nlmsg *nlmsg);
  */
 void *nlmsg_data(struct nlmsg *nlmsg);
 
+extern int addattr(struct nlmsghdr *n, size_t maxlen, int type,
+		   const void *data, size_t alen);
 
 #endif

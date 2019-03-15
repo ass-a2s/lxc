@@ -22,11 +22,12 @@
 
 #ifndef __LXC_CONTAINER_H
 #define __LXC_CONTAINER_H
+
 #include <malloc.h>
 #include <semaphore.h>
 #include <stdbool.h>
-#include <stdlib.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include <lxc/attach_options.h>
 
@@ -40,8 +41,10 @@ extern "C" {
 #define LXC_CLONE_KEEPBDEVTYPE    (1 << 3) /*!< Use the same bdev type */
 #define LXC_CLONE_MAYBE_SNAPSHOT  (1 << 4) /*!< Snapshot only if bdev supports it, else copy */
 #define LXC_CLONE_MAXFLAGS        (1 << 5) /*!< Number of \c LXC_CLONE_* flags */
+#define LXC_CLONE_ALLOW_RUNNING   (1 << 6) /*!< allow snapshot creation even if source container is running */
 #define LXC_CREATE_QUIET          (1 << 0) /*!< Redirect \c stdin to \c /dev/zero and \c stdout and \c stderr to \c /dev/null */
 #define LXC_CREATE_MAXFLAGS       (1 << 1) /*!< Number of \c LXC_CREATE* flags */
+#define LXC_MOUNT_API_V1		   1
 
 struct bdev_specs;
 
@@ -52,6 +55,10 @@ struct lxc_lock;
 struct migrate_opts;
 
 struct lxc_console_log;
+
+struct lxc_mount {
+	int version;
+};
 
 /*!
  * An LXC container.
@@ -293,7 +300,7 @@ struct lxc_container {
 	bool (*destroy)(struct lxc_container *c);
 
 	/*!
-	 * \brief Save configuaration to a file.
+	 * \brief Save configuration to a file.
 	 *
 	 * \param c Container.
 	 * \param alt_file Full path to file to save configuration in.
@@ -818,7 +825,7 @@ struct lxc_container {
 	/*!
 	 * \brief An API call to perform various migration operations
 	 *
-	 * \param cmd One of the MIGRATE_ contstants.
+	 * \param cmd One of the MIGRATE_ constants.
 	 * \param opts A migrate_opts struct filled with relevant options.
 	 * \param size The size of the migrate_opts struct, i.e. sizeof(struct migrate_opts).
 	 *
@@ -846,6 +853,20 @@ struct lxc_container {
 	 * \return \c true if the container was rebooted successfully, else \c false.
 	 */
 	bool (*reboot2)(struct lxc_container *c, int timeout);
+
+	/*!
+	 * \brief Mount the host's path `source` onto the container's path `target`.
+	 */
+	int (*mount)(struct lxc_container *c, const char *source,
+		     const char *target, const char *filesystemtype,
+		     unsigned long mountflags, const void *data,
+		     struct lxc_mount *mnt);
+
+	/*!
+	 * \brief Unmount the container's path `target`.
+	 */
+	int (*umount)(struct lxc_container *c, const char *target,
+		      unsigned long mountflags, struct lxc_mount *mnt);
 };
 
 /*!
@@ -1103,6 +1124,13 @@ void lxc_log_close(void);
  * \param key Configuration item to check for.
  */
 bool lxc_config_item_is_supported(const char *key);
+
+/*!
+ * \brief Check if an API extension is supported by this LXC instance.
+ *
+ * \param extension API extension to check for.
+ */
+bool lxc_has_api_extension(const char *extension);
 
 #ifdef  __cplusplus
 }
